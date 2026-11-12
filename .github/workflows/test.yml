@@ -1,0 +1,22 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 统一只跑 Node 24（Active LTS）；旧版本已弃用或仅维护期。
+        # actions/checkout@v7 / actions/setup-node@v7 自身也是 node24 runtime。
+        node: [24]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Offline smoke test
+        run: npm test

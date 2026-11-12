@@ -1,0 +1,44 @@
+# dsh-plugin-wechat-session 聚合包的 profile 挂载层（v1.2.0）。
+#
+# 一个包挂两条 cordis loader 行，实现「装这一个包就带上两个插件」：
+#   ① 微信会话互通自己
+#   ② @xmanrui/dsh-im（微信机器人，普通微信主动投递）
+# 两个插件的代码仍各自独立；dsh-im 继续走 npm 官方源、可单独升级。
+#
+# 宿主 client 半边是按每条 loader 行的 options.name 逐条扫描的（client-modules
+# 已证实）：两条行会各自加载自己包里的 ./client，因此「微信会话互通」设置页
+# 与 dsh-im 的「IM机器人」设置页都会保留。
+#
+# 【关键约束】@xmanrui/dsh-im 必须保留在 profile 顶层 dependencies（^5.10.0，
+# 可升级范围）——这是它能被市场「检查更新」和它自带更新器识别的前提；
+# 但「不要」同时把它作为独立条目留在 dsh.profile.bundles 里，否则那一行的
+# patch 会再挂一条同 name 的 entry，与聚合包这条重复挂载 → 启动报
+# "duplicate prefix route" / 同名包多来源。切换时请把独立行从 bundles 移除。
+#
+# 第二条带 name 级防重守卫：若在本行之前已有别的 enabled 行挂了
+# @xmanrui/dsh-im（例如某次操作把独立 bundle 又加了回来且排在前面），
+# 本行就退避，让先挂载的那条拥有它，避免双挂。loader 按 entry-list 顺序
+# 求值、只看本行之前的行（与 dsh-better-sidebar 的守卫同一范式）。
+#
+# 覆盖方式：profile 里同名 id 的行会「整份替换」下面的 config（不做深合并），
+# 所以 lib/index.js 的 normalizeConfig 会对每个缺省 key 用同样的默认值兜底。
+# 若要把微信目标放在服务端而不是设置页，可在这里填 config.botId / config.targetId；
+# 但注意本文件随 profile 落盘、对本机用户可读，更推荐在插件设置页里填写。
+- insert:
+    - id: dsh-plugin-wechat-session
+      name: 'dsh-plugin-wechat-session'
+      config:
+        # 服务端兜底：dsh-im 微信机器人的 Bot ID（留空则用浏览器设置页里保存的值）
+        botId: ''
+        # 服务端兜底：该机器人下指定的那一个微信目标 ID（稳定别名）
+        targetId: ''
+    # 这条用一个独立 id（与 dsh-im 自带 patch 的 id 不同），是为了让下面守卫里的
+    # 「自排除」能区分「自己」和「另一条同名 entry」：若沿用相同 id，自排除会把需要
+    # 退避的那条独立挂载也一起排除掉，守卫就失效了。照抄 dsh-better-sidebar 的
+    # 已验证范式（disabled 里带 `&& e.options.id !== '<自己 id>'`），两种 loader
+    # 实现（求值时 entries() 是否含当前行）下都正确。
+    # 已核实 dsh-im 的微信机器人配置不按 loader entry id 索引（走 settings /
+    # credential-store），换 id 不影响你已配好的微信机器人。
+    - id: dsh-plugin-wechat-session-dsh-im
+      name: '@xmanrui/dsh-im'
+      disabled: !!js "[...ctx.loader.entries()].some((e) => e.options.name === '@xmanrui/dsh-im' && e.options.id !== 'dsh-plugin-wechat-session-dsh-im' && !e.disabled)"

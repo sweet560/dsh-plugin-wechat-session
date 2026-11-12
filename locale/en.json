@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "微信会话互通 (WeChat Session Bridge)",
+    "description": "Umbrella bundle: installing this one package brings both the WeChat Session Bridge reminder and the @xmanrui/dsh-im WeChat bot. With several sessions running, only the ones you are NOT looking at raise alerts (the session on screen stays quiet). Approval, question and task-finished all raise one system toast with real content (same format as dsh-pet) that you can click to jump to that session. Two event classes have separate configurable timeouts (choice/approval 60s, task-finished 30s by default); if neither switching to the session nor clearing the pending item happens in time, the dsh-im bot pushes a checklist with the original question and numbered options to one fixed WeChat chat, so you can reply with a number or approve directly in WeChat (requires dsh-im two-way sync)."
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "name": "dsh-plugin-wechat-session",
+  "version": "1.6.0",
+  "description": "微信会话互通聚合包：装这一个包就同时带上「桌面弹窗 / 系统通知 + 提示音」与 @xmanrui/dsh-im 微信机器人。多条会话并行时逐条监督，需要手动选择 / 需要确认权限 / 任务跑完都会弹一张带具体内容、点击可跳到对应会话的系统通知并响提示音；两类事件各有独立超时（需选择 / 确认默认 60 秒、任务跑完默认 30 秒），超时没切过去看 / 没把待办处理掉，就由微信机器人把带问题原文与编号选项的清单提醒发到你指定的那一个微信对话，可直接在微信里回复选择。",
+  "license": "MIT",
+  "author": "sweet560 <107355972+sweet560@users.noreply.github.com>",
+  "type": "module",
+  "main": "lib/index.js",
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/en.json",
+    "locale/zh.json",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "docs/RELEASE_NOTES_v1.5.0.md",
+    "docs/RELEASE_NOTES_v1.6.0.md",
+    "smoke/smoke-test.mjs"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "notification",
+    "wechat",
+    "dsh-im",
+    "desktop-notification",
+    "reminder",
+    "approval",
+    "session",
+    "聚合包",
+    "一次安装",
+    "会话监督",
+    "联动提醒",
+    "桌面弹窗",
+    "系统通知",
+    "微信通知",
+    "微信机器人",
+    "提示音",
+    "超时提醒"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node smoke/smoke-test.mjs",
+    "pack": "npm pack --dry-run"
+  },
+  "dependencies": {
+    "@xmanrui/dsh-im": "^5.10.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sweet560/dsh-plugin-wechat-session.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sweet560/dsh-plugin-wechat-session/issues"
+  },
+  "homepage": "https://github.com/sweet560/dsh-plugin-wechat-session#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    },
+    "manifestVersion": 1
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-client-locale": ">=0.2.0-rc.1 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-locale": {
+      "optional": true
+    }
+  }
+}

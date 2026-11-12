@@ -1,0 +1,93 @@
+# 自动把仓库更新发布到 npm (registry.npmjs.org)，走 npm 可信发布（Trusted Publishing / OIDC）。
+# 触发：推到 main、打 v* tag、发布 GitHub Release，或在 Actions 页面手动运行。
+#
+# 关键约束 —— npm 版本不可变：同一个 version 只能 publish 一次，重复发布会被 registry 拒绝。
+# 因此「更新后自动推送」的正确语义是：当 package.json 的 version 变成 registry 上
+# 尚不存在的值（例如重大更新升了版本号）时自动发布；没改版本号的 push 会被下面的
+# 幂等守卫安全跳过，不会报错。
+#
+# 与旧版 NPM_TOKEN 流程的区别（借鉴 sweet560/dsh-plugin-deepseek-chat 的 publish.yml）：
+#   * 不再用长期令牌：完全去掉 NPM_TOKEN / NODE_AUTH_TOKEN；凭证由 GitHub OIDC 现场签发。
+#   * permissions 必须有 id-token: write，否则拿不到 OIDC token。
+#   * Node 用 24（Active LTS，满足 npm 可信发布对 Node 的最低要求），
+#     npm 需 >= 11.5.1（故先 npm install -g npm@latest）。
+#   * npm publish 带 --provenance 生成来源证明；不再设置 NODE_AUTH_TOKEN。
+#
+# 一次性前提（npmjs.com 网页操作，CI 之外，需人工完成一次）：
+#   在本包 npm 页面 -> Settings -> Trusted Publisher -> Add a trusted publisher (GitHub Actions)，填：
+#     Organization or user : sweet560
+#     Repository           : dsh-plugin-wechat-session
+#     Workflow filename    : publish.yml        <-- 必须与实际文件名逐字一致，改名即失效
+#     Environment name     : 留空（本 workflow 不用 GitHub Environment）
+#   注意：org/user 大小写要与 GitHub URL 完全一致；package.json 的 repository.url 已指向本仓库。
+#   注意「先有鸡还是先有蛋」：npm 要求包先存在才能配置 Trusted Publisher，
+#   所以本仓库（改名为 dsh-plugin-wechat-session 后的全新包名）的 1.6.0 首版
+#   必须用本机已登录的 npm 账号手动 `npm publish --access public` 先建包；
+#   建包后再到 npmjs.com 完成上面的 Trusted Publisher 配置，之后的版本
+#   （升了 version 的 push / tag）才由本 workflow 用 OIDC 自动发布。
+#   详见 docs/RELEASE_NOTES_v1.6.0.md 与 README.md 第 9.1 节。
+
+name: publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # 关键：启用 OIDC，缺这一行 npm 可信发布必然 404/鉴权失败
+
+# 同一「版本号」的发布串行执行且不被后续触发取消，避免并发抢注同一个版本号。
+# 注意：不能按 github.ref 分组——push main 与 push tag v* 是两条不同的 ref，
+# 同一个 package.json 版本会被触发两次并发抢发（v1.6.0 曾因此报一次 benign E409）。
+concurrency:
+  group: npm-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # 统一用 Node 24（Active LTS），满足 npm 可信发布对 Node 版本的最低要求。
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          # v7 起 setup-node 原生跑 node24 runtime，并提供 package-manager-cache 输入；
+          # 本 job 不装依赖，无需缓存（package.json 也没有 packageManager 字段，默认不会缓存）。
+
+      # npm 可信发布要求 npm CLI >= 11.5.1；setup-node 自带的可能偏旧，统一升级。
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      # 发布前质量门：离线冒烟测试，纯 node 脚本，无需 npm install。
+      - name: Self-check
+        run: npm test
+
+      # 幂等守卫：仅当该版本在 registry 上还不存在时才发布。
+      - name: Check if version is already published
+        id: version
+        shell: bash
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "::notice::$NAME@$VERSION already on npm - skip (bump package.json version to publish)."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$NAME@$VERSION not published yet - will publish via OIDC trusted publishing."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 不设置 NODE_AUTH_TOKEN：npm 会用 id-token: write 签发的 OIDC token 自动换取发布凭证。
+      - name: Publish to npm (OIDC trusted publishing)
+        if: steps.version.outputs.should_publish == 'true'
+        run: npm publish --provenance --access public
