@@ -13,6 +13,18 @@
 #     npm 需 >= 11.5.1（故先 npm install -g npm@latest）。
 #   * npm publish 带 --provenance 生成来源证明；不再设置 NODE_AUTH_TOKEN。
 #
+# E409 修复（v1.7.0 发版实测）：
+#   升一个版本号 + 打 tag + 发 Release 会同时命中 push main / push tag / release published
+#   三个触发源，于是同一版本被排了 3 个 run。npm registry 对「刚发布的版本」有秒级
+#   传播延迟，后一个 run 的幂等守卫若恰好查到旧缓存会误判「还没发布」→ 再 publish 一次
+#   → 不可变版本冲突 `409 Conflict - Cannot publish over previously staged version ...`（E409）。
+#   两层防护：
+#     ① 幂等守卫带 --prefer-online 并短轮询重试，尽量让重复 run 直接「跳过」而非抢发；
+#     ② 万一仍并发撞上，publish 步骤把 E409 当作「该版本已被同批 run 发布成功」的
+#        幂等结果：回查 registry 确认版本已存在即成功，不再把 benign 冲突报成失败。
+#   concurrency 维持「按仓库排队、不取消」：删掉或改成 cancel-in-progress:true 反而可能
+#   取消掉真正正在发布的那个 run。
+#
 # 一次性前提（npmjs.com 网页操作，CI 之外，需人工完成一次）：
 #   在本包 npm 页面 -> Settings -> Trusted Publisher -> Add a trusted publisher (GitHub Actions)，填：
 #     Organization or user : sweet560
@@ -71,6 +83,8 @@ jobs:
         run: npm test
 
       # 幂等守卫：仅当该版本在 registry 上还不存在时才发布。
+      # --prefer-online 绕过本地缓存；短轮询重试以吸收「刚发布完、registry 还没传播开」
+      # 的秒级延迟，让同一次发版触发的重复 run 尽量直接跳过，而不是抢发同一个版本号。
       - name: Check if version is already published
         id: version
         shell: bash
@@ -79,7 +93,17 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+          echo "PKG_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "PKG_VERSION=$VERSION" >> "$GITHUB_ENV"
+          published=false
+          for i in 1 2 3; do
+            if npm view --prefer-online "$NAME@$VERSION" version >/dev/null 2>&1; then
+              published=true
+              break
+            fi
+            if [ "$i" -lt 3 ]; then sleep 3; fi
+          done
+          if [ "$published" = "true" ]; then
             echo "::notice::$NAME@$VERSION already on npm - skip (bump package.json version to publish)."
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
           else
@@ -88,6 +112,30 @@ jobs:
           fi
 
       # 不设置 NODE_AUTH_TOKEN：npm 会用 id-token: write 签发的 OIDC token 自动换取发布凭证。
+      # E409 兜底：若同一版本被同一次发版的另一个 run 抢先发布（registry 传播竞态），
+      # npm 会返回 409 不可变版本冲突；回查 registry 确认版本已存在即视为幂等成功，
+      # 不再把这个 benign 冲突报成失败。
       - name: Publish to npm (OIDC trusted publishing)
         if: steps.version.outputs.should_publish == 'true'
-        run: npm publish --provenance --access public
+        shell: bash
+        run: |
+          OUT=$(npm publish --provenance --access public 2>&1) && RC=0 || RC=$?
+          printf '%s\n' "$OUT"
+          if [ "$RC" -eq 0 ]; then
+            echo "::notice::$PKG_NAME@$PKG_VERSION published successfully via OIDC."
+            exit 0
+          fi
+          if printf '%s' "$OUT" | grep -qiE 'E409|409 Conflict|Cannot publish over previously staged version'; then
+            echo "::warning::npm publish hit E409 (version already staged); verifying it is live on registry..."
+            for i in 1 2 3 4 5 6; do
+              if npm view --prefer-online "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
+                echo "::notice::$PKG_NAME@$PKG_VERSION is live on npm - E409 treated as idempotent success."
+                exit 0
+              fi
+              if [ "$i" -lt 6 ]; then sleep 3; fi
+            done
+            echo "::error::E409 but $PKG_NAME@$PKG_VERSION not visible on registry after retry."
+            exit 1
+          fi
+          echo "::error::npm publish failed with exit $RC (not an E409)."
+          exit 1
