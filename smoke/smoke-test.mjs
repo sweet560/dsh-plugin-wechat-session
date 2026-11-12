@@ -20,7 +20,7 @@ function ok(label) { passed += 1; console.log('  ✓ ' + label); }
 // ───────────────────── 1. 清单 / 静态文件 ─────────────────────
 const pkg = await readJson('package.json');
 assert.equal(pkg.name, 'dsh-plugin-wechat-session');
-assert.equal(pkg.version, '1.6.0');
+assert.equal(pkg.version, '1.7.0');
 assert.equal(pkg.type, 'module');
 assert.equal(pkg.main, 'lib/index.js');
 assert.equal(pkg.icon, 'icon.svg');
@@ -30,7 +30,7 @@ assert.equal(pkg.dsh.client.platform, 'web');
 assert.ok(Array.isArray(pkg.dsh.client.inject) && pkg.dsh.client.inject.length >= 1);
 assert.equal(pkg.exports['.'], './lib/index.js');
 assert.equal(pkg.exports['./client'], './lib/client.js');
-ok('package.json 基本字段与 dsh 声明（v1.6.0 三类都弹带内容通知 + 会话级聚合包）');
+ok('package.json 基本字段与 dsh 声明（v1.7.0 唯一浮层弹窗 + 卡片式设置页 + 会话级聚合包）');
 
 // 聚合包：声明可升级范围的 dsh-im 直接依赖，装伞包自动带上微信机器人
 assert.ok(pkg.dependencies?.['@xmanrui/dsh-im'], '缺少 @xmanrui/dsh-im 依赖');
@@ -296,19 +296,24 @@ const store = new Map();
 const listeners = {};             // vm 内 uiSession.subscribe 回调写这里
 const winListeners = {};          // window 事件回调：type -> [fn]
 const docListeners = {};          // document 事件回调：type -> [fn]
-const createdNotifications = [];  // 所有 new Notification 实例
+// m05207：只留一个弹窗（应用内浮层）。旧断言名 createdNotifications 改为
+// 指向浮层数组，让「弹了几张卡」的历史断言继续成立；OS 通知单独计数，应为 0。
+const appendedElements = [];      // m05207：唯一的「弹窗」= 应用内浮层卡片
+const createdNotifications = appendedElements; // 兼容旧断言名：弹窗计数即浮层数量
+const osNotifications = [];       // new Notification 实例（本轮起应为 0）
 const fetchCalls = [];            // 所有 sendWechat 的 fetch
 const batchTimeouts = [];         // root.setTimeout 的调用（30 秒批次计时）
 const clearedTimeouts = [];       // root.clearTimeout 的调用（取消批次）
 const miscTimeouts = [];          // 裸 setTimeout（toast 自动关闭等）
 const permissionRequests = [];    // m03179：Notification.requestPermission 调用记录
+const createdElements = [];       // m04774：document.createElement 产物（应用内浮层）
 let timerSeq = 0;
 
 function addListener(bag, type, fn) { (bag[type] || (bag[type] = [])).push(fn); }
 function fire(bag, type) { (bag[type] || []).forEach((fn) => { try { fn({}); } catch (e) {} }); }
 
 class FakeNotification {
-  constructor(title, opts) { this.title = title; this.opts = opts; this.closed = false; createdNotifications.push(this); }
+  constructor(title, opts) { this.title = title; this.opts = opts; this.closed = false; osNotifications.push(this); }
   close() { this.closed = true; }
   static permission = 'granted';
   static requestPermission() {
@@ -338,10 +343,21 @@ const fakeWindow = {
     load(entry) { fakeWindow.__entry = entry; },
   },
 };
+function makeFakeElement() {
+  const el = {
+    style: {}, className: '', textContent: '', onclick: null, children: [],
+    removed: false,
+    setAttribute() {}, appendChild(c) { el.children.push(c); }, remove() { el.removed = true; },
+  };
+  createdElements.push(el);
+  return el;
+}
 const fakeDocument = {
   hidden: true, visibilityState: 'hidden', hasFocus: () => false,
-  body: { appendChild() {} },
-  createElement() { return { style: {}, remove() {} }; },
+  // m05207：只把「应用内浮层卡片」计入弹窗数组；jumpToSession 创建的
+  // Electron iframe 也是 appendChild 产物，但不应算作一次「弹窗」。
+  body: { appendChild(el) { if (el.className === 'dsh-pws-inapp-toast') appendedElements.push(el); } },
+  createElement() { return makeFakeElement(); },
   addEventListener(type, fn) { addListener(docListeners, type, fn); },
   removeEventListener(type, fn) { const a = docListeners[type] || []; const i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); },
 };
@@ -770,25 +786,64 @@ assert.equal(typeof dbg.permissionPending, 'boolean', 'debug 应能读出权限�
 ok('回归【m03179】：debug() 暴露通知权限/音频状态/提示音开关，便于实测核验');
 
 // ③ 行为级：模拟「DSH 重开后权限丢回 default、窗口在后台、用户还没点过窗口」。
-// 旧版此刻弹窗会被 permission 门槛整段跳过且永不重试；修复后 toast 会先
-// ensurePermission() 重新申请（mock 里同步授予），因此仍能弹出这张卡。
+// m05207：现在弹窗只剩应用内浮层，与系统权限无关；但 ensurePermission() 仍会
+// 在每次提醒前重试申请（音频解锁也靠它），所以仍断言它会重新申请一次。
 FakeNotification.permission = 'default';
 const reqBefore = permissionRequests.length;
-const notesFix0 = createdNotifications.length;
+const notesFix0 = appendedElements.length;
+const osFix0 = osNotifications.length;
 fakeWindow.__dshPluginWechatSession.testDesktop();
 assert.equal(permissionRequests.length, reqBefore + 1,
   '权限丢失为 default 时，提醒前应主动重新申请通知权限');
 assert.equal(FakeNotification.permission, 'granted', '重新申请后权限应恢复为 granted');
-assert.equal(createdNotifications.length, notesFix0 + 1,
-  '权限刚恢复的场景下，桌面弹窗仍应真正弹出（不再静默失败）');
-const fixNote = createdNotifications[createdNotifications.length - 1];
-assert.notEqual(fixNote.opts.silent, true, '新通知不能是静音的（系统提示音兜底保留）');
-ok('回归【m03179】：后台 + 权限丢失(default)时仍主动申请并弹出通知，不再无声无息');
+assert.equal(appendedElements.length, notesFix0 + 1,
+  '权限丢回 default 也应挂出 1 张应用内浮层（不再静默失败）');
+assert.equal(osNotifications.length, osFix0,
+  '不应再 new Notification（只留浮层一个弹窗）');
+ok('回归【m03179/m05207】：后台 + 权限丢失(default)时仍主动申请权限，且只弹浮层不弹 OS 横幅');
 
-// ── 回归【m03992】：微信清单（像图1那样列问题原文 + 编号选项）+ 双超时 ──
-// 五项决策：①清单式富文本 ②借 dsh-im 双向同步真回填（配置指引）③独立
-// attentionTimeoutSec 默认 60 秒 ④done 段突出「哪个会话完成了」⑤只本地修。
-// 旧版只拼 "- label（时间）"，没有问题/选项，也没法在微信里直接选。
+// ── 回归【m04774① / m05207】：应用内浮层是「唯一」的弹窗 ──
+// 用户实测：人在别的会话界面 + 系统通知未授权 → 只有提示声、看不到任何弹窗。
+// m04774① 加了不依赖系统权限的浮层；m05207 又反馈「浮层 + OS 横幅两张太复杂」，
+// 于是去掉 OS 横幅，每次提醒只留这一张浮层 + 提示音。
+setAway(true);
+FakeNotification.permission = 'denied';          // OS 通知即使彻底不可用也不影响浮层
+const appBefore = appendedElements.length;
+const osBefore = osNotifications.length;
+const jumpsBefore = openSessionCalls.length;
+fakeWindow.__dshPluginWechatSession.testDesktop();
+assert.equal(osNotifications.length, osBefore,
+  '只留一个弹窗：不应再 new Notification（系统横幅已移除）');
+assert.equal(appendedElements.length, appBefore + 1,
+  '每次提醒只挂出 1 张应用内浮层卡片');
+const card = appendedElements[appendedElements.length - 1];
+assert.equal(card.className, 'dsh-pws-inapp-toast', '浮层应带可识别的 className');
+assert.equal(card.style.right, '16px', '浮层应贴在右下角（right: 16px）');
+assert.equal(card.style.bottom, '16px', '浮层应贴在右下角（bottom: 16px）');
+assert.ok(!card.style.top, '浮层不应再贴在顶部（已移到右下角）');
+assert.ok(card.children.length >= 2, '浮层应含标题与正文/点击提示');
+assert.match(card.children[0].textContent, /对话完成/, '浮层标题应写明事件（对话完成）');
+card.onclick();                                  // 模拟点击
+assert.equal(card.removed, true, '点击后浮层应自行关闭');
+assert.equal(openSessionCalls.length, jumpsBefore + 1, '点击浮层应跳到对应会话');
+FakeNotification.permission = 'granted';        // 恢复，后续用例照常
+ok('回归【m04774①/m05207】：只弹 1 张应用内浮层（右下角、可点跳会话），不再有第二个 OS 横幅');
+
+// ── 回归【m04774③】：真回填交 dsh-im 原生同步提问，配置指引只放设置页 ──
+// 源码级静态断言：确认「微信里回 1 直接选」的方案确实落进代码，
+// 且本插件自己发的微信里不再出现「回编号即可」的误导话术。
+assert.match(clientSrc, /function showInAppToast/, '应存在应用内浮层实现');
+assert.match(clientSrc, /wechatSyncGuide/, '设置页应有 dsh-im 同步提问的配置指引');
+assert.match(clientSrc, /\/sessionlist/, '指引应给出 /sessionlist 绑定步骤');
+assert.match(clientSrc, /user-questions\/request|\/session </, '指引/文案应指向 dsh-im 原生同步提问');
+assert.ok(!/微信回[「']?编号/.test(clientSrc), '微信文案不应再有「回编号即可」的误导话术');
+ok('回归【m04774③】：真回填交 dsh-im 原生同步提问，设置页给绑定步骤，微信文案去掉误导话术');
+
+// ── 回归【m03992 / m04774②】：微信极简超时提醒 + 双超时 ──
+// 原决策：①清单式富文本 ②借 dsh-im 双向同步真回填 ③独立 attentionTimeoutSec
+// 默认 60 秒 ④done 段突出「哪个会话完成了」⑤只本地修。
+// m04774 实测清单文字墙太乱、且本插件发的微信收不到回复 → 改成「一行标题 +
+// 每条会话一行 + 一句别在这条下回复」的极简留底；真回填交给 dsh-im 原生同步提问。
 function drainBatch() {
   let g = 0;
   while (fakeWindow.__dshPluginWechatSession.debug().batch && batchTimeouts.length && g++ < 40) {
@@ -805,8 +860,9 @@ store.set('dshPluginWechatSession.config', JSON.stringify({
   sound: true, volume: 0.5, wechatEnabled: true, notifyPermission: true,
 }));
 
-// A. 需选择 / 确认类：真实 PendingQuestion（问题原文 + 编号选项），
-//    独立超时 60 秒，微信清单里要出现会话名、问题、1) 2) 选项、回复格式与 dsh-im 绑定指引。
+// A. 需选择 / 确认类：真实 PendingQuestion，独立超时 60 秒。
+//    微信只发「一行标题 + 会话一行 + 别在这条下回复」的极简提醒，
+//    不再拼问题原文 / 编号选项 / 回复格式 / 绑定长文（m04774）。
 setAway(true);
 setSessions('sA', { sAsk: { displayTitle: '发布方案评审' } });
 const tAsk0 = batchTimeouts.length;
@@ -832,19 +888,19 @@ pushStatus(new Map([
 assert.equal(batchTimeouts.length, tAsk0 + 1, 'question 应起一个微信批次');
 assert.equal(batchTimer().ms, 60000, '需选择/确认类独立超时 = 60 秒');
 batchTimer().fn();
-assert.equal(fetchCalls.length, fAsk0 + 1, '清单应发一条微信');
+assert.equal(fetchCalls.length, fAsk0 + 1, '极简提醒应发一条微信');
 const despAsk = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
-assert.match(despAsk, /【等你拍板】/, '清单应有「等你拍板」段');
+assert.match(despAsk, /【等你处理】/, '应有「等你处理」标题');
 assert.match(despAsk, /会话「发布方案评审」/, '应写清是哪条会话');
-assert.match(despAsk, /用哪种发布通道？/, '应含问题原文（不再是 label+时间）');
-assert.match(despAsk, /1\) npm/, '应含编号选项 1');
-assert.match(despAsk, /2\) Gitee Release/, '应含编号选项 2');
-assert.match(despAsk, /微信回/, '应给出「回编号/批准」的回复格式');
-assert.match(despAsk, /双向同步/, '应给 dsh-im 双向同步（真回填）配置指引');
+assert.ok(!/用哪种发布通道？/.test(despAsk), '极简版不应再堆问题原文');
+assert.ok(!/1\) npm/.test(despAsk), '极简版不应再列编号选项');
+assert.ok(!/微信回/.test(despAsk), '极简版不应再给「回编号即可」的误导话术');
+assert.ok(!/双向同步/.test(despAsk), '极简版不应再塞绑定长文（已移到设置页）');
+assert.ok(despAsk.split('\n').filter(Boolean).length <= 6, '整条微信应短、干净、不成为文字墙');
 assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, null, '发完后批次应清空');
-ok('回归【m03992】：需选择类 60 秒超时把问题原文+编号选项列成图1式清单发微信（含会话名/回复格式/dsh-im 绑定指引）');
+ok('回归【m04774②】：需选择类 60 秒超时只发干净极简提醒（会话名 + 一句别回复），不再堆文字墙');
 
-// B. 任务跑完类：沿用 timeoutSec = 30 秒，清单【已完成】段突出「哪个会话完成了」。
+// B. 任务跑完类：沿用 timeoutSec = 30 秒，极简微信里【已完成】段突出「哪个会话完成了」。
 setSessions('sA', { sFin: { displayTitle: '周报生成' } });
 const tFin0 = batchTimeouts.length;
 const fFin0 = fetchCalls.length;
@@ -861,9 +917,9 @@ assert.equal(batchTimer().ms, 30000, '任务跑完类仍用 timeoutSec = 30 秒'
 batchTimer().fn();
 assert.equal(fetchCalls.length, fFin0 + 1, 'done 应发一条微信');
 const despFin = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
-assert.match(despFin, /【已完成】/, '清单应有「已完成」段');
+assert.match(despFin, /【已完成】/, '极简微信应有「已完成」段');
 assert.match(despFin, /会话「周报生成」已完成/, '应一眼看出是哪个会话完成了');
-ok('回归【m03992】：任务跑完类仍 30 秒，微信清单【已完成】段突出「会话「XXX」已完成」');
+ok('回归【m03992 / m04774②】：任务跑完类仍 30 秒，极简微信【已完成】段突出「会话「XXX」已完成」');
 
 // C. 两类混在一批：计时器对准最早 deadline，到点只发到期项，未到期项
 //    留在批次里重排（不被提前一起发掉）——这是双超时不串台的关键。
@@ -886,13 +942,40 @@ batchTimer().fn();                                    // 只发到期的 done
 assert.equal(fetchCalls.length, fMix0 + 1, '第一次只发到期项');
 const despMix1 = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
 assert.match(despMix1, /【已完成】/, '第一次应只含「已完成」');
-assert.ok(!/【等你拍板】/.test(despMix1), '未到期的 question 不该被提前发掉');
+assert.ok(!/【等你处理】/.test(despMix1), '未到期的 question 不该被提前发掉');
 assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, 1, '未到期项应留在批次里继续等');
 batchTimer().fn();                                    // 发剩下到期的 question
 assert.equal(fetchCalls.length, fMix0 + 2, '第二次发剩下的 question');
 const despMix2 = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
-assert.match(despMix2, /【等你拍板】/, '第二次应含「等你拍板」');
+assert.match(despMix2, /【等你处理】/, '第二次应含极简「等你处理」提醒');
 assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, null, '全发完后批次应清空');
 ok('回归【m03992】：两类混批按各自 deadline 分次发，30 秒的先发、60 秒的留到下一次，不串台');
+
+// ── 回归【m05207】：只留一个弹窗 + 设置页卡片式分组 ──
+// 用户反馈「浮层 + OS 横幅两个弹窗太复杂」「设置界面太丑」。按决策：
+//   ① toast() 去掉 new Notification，每次提醒只挂 1 张应用内浮层；
+//   ② 设置页重排成卡片式分组，顶部一大段说明收成可展开提示。
+// 全量回归里已经发过很多次提醒，这里做一次「全程 0 个 OS 通知」的强校验。
+assert.equal(osNotifications.length, 0,
+  '整轮测试里不应再产生任何 new Notification（只留浮层一个弹窗）');
+assert.ok(!/new Notification\s*\(/.test(clientSrc), '源码里不应再有 new Notification 调用');
+assert.match(clientSrc, /function showInAppToast/, '唯一的弹窗应来自应用内浮层实现');
+assert.match(clientSrc, /function toast[\s\S]{0,260}?showInAppToast\(/,
+  'toast() 应直接调 showInAppToast()，不经 OS 通知分支');
+ok('回归【m05207①】：全程只弹 1 类弹窗（应用内浮层），源码与运行态都不再有 OS 横幅');
+
+// 设置页卡片式分组：源码级（分组标题 / card() / 可展开短说明），并再跑一次
+// 渲染工厂确保重写后的整棵 React 树不抛异常。
+assert.match(clientSrc, /function card\(/, '设置页应按主题渲染分组卡片');
+assert.match(clientSrc, /groupBasic/, '应有「基础」分组');
+assert.match(clientSrc, /groupBot/, '应有「微信机器人 / 目标」分组');
+assert.match(clientSrc, /groupTimeout/, '应有「超时」分组');
+assert.match(clientSrc, /groupAlert/, '应有「提醒方式」分组');
+assert.match(clientSrc, /groupWechat/, '应有「在微信里直接选择」分组');
+assert.match(clientSrc, /groupTest/, '应有「测试」分组');
+assert.match(clientSrc, /sectionHintShort/, '顶部说明应收成简短副标题');
+assert.match(clientSrc, /detailsLabel/, '完整说明应可展开（不再一上来一大段文字墙）');
+assert.doesNotThrow(() => section.render(), '重排后的设置页渲染工厂应无异常');
+ok('回归【m05207②】：设置页重排成卡片式分组（5 组 + 可展开说明 + 主次按钮），渲染无异常');
 
 console.log(`\n全部通过：${passed} 项断言。`);

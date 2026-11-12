@@ -4,13 +4,19 @@ A reminder plugin for the **DeepSeek Harness desktop app**. It watches all your 
 sessions and links desktop alerts with a WeChat fallback.
 
 > When a session **needs your manual choice**, **needs permission approval**, or **finishes its
-> turn**, it raises a **desktop notification (system toast + alert sound)** with the real content,
-> and you can **click the notification to jump to that session**. If you neither switch to that
-> session nor clear its pending item within the timeout, it sends a reminder to one fixed WeChat
-> chat through the **dsh-im WeChat bot (regular WeChat)**. Two event classes have separate,
-> configurable timeouts: **"needs choice / approval" defaults to 60s**, **"task finished" defaults
-> to 30s**; the former's WeChat message is a checklist with the **original question + numbered
-> options** so you can reply with a number / "approve" directly in WeChat (see Chinese README §3.1).
+> turn**, it raises a **desktop alert**: exactly ONE **in-app floating card** (does NOT depend on OS
+> notification permission — visible even when you are on another session, click to jump there) plus
+> an alert sound. No OS banner is shown anymore, so there is only one popup. If you neither switch to that
+> session nor clear its pending item within the timeout, it sends a **minimal** WeChat reminder
+> (just "which session is waiting", no walls of text) through the **dsh-im WeChat bot (regular
+> WeChat)**. Two event classes have separate, configurable timeouts: **"needs choice / approval"
+> defaults to 60s**, **"task finished" defaults to 30s**.
+>
+> To answer "1 / choose 1" directly in WeChat and let the task continue: that is done by **dsh-im
+> native synced questions** — bind the current session to a WeChat private chat with two-way sync
+> enabled, and dsh-im pushes a numbered option card as soon as the question appears; replying with
+> a number writes the answer back into DSH. **Replies to messages this plugin sends are NOT
+> received** — do not reply under that reminder. Setup steps: Chinese README §3.1.
 
 Installing this one package brings both the WeChat Session Bridge plugin and `@xmanrui/dsh-im`
 (the WeChat bot). See the Chinese [README.md](./README.md) for full documentation.
@@ -26,15 +32,19 @@ Installing this one package brings both the WeChat Session Bridge plugin and `@x
   all sessions raise alerts.
 - "Responded" = switching to that session or clearing its pending item — cancels WeChat fallback.
 - WeChat fallback via dsh-im proactive delivery; no external webhook / Server 酱 / SendKey needed.
+- One in-app floating card only (no OS banner): it needs no OS notification permission and shows
+  on any session screen, fixing "only the sound plays, no popup" without a second duplicate popup.
 - Per-class timeouts (choice/approval 60s, task-finished 30s by default), each item carrying its
-  own deadline; the overdue batch is sent as a checklist: a **[waiting on you]** section with the
-  question text and numbered options (reply format included) and a **[finished]** section that
-  spells out "session「X」finished".
-- "Reply directly in WeChat" is powered by **dsh-im two-way sync** (interactive questions / remote
-  approvals), not by this plugin parsing replies: bind that session to a WeChat private chat with
-  two-way sync enabled and make sure the Bot ID / Target ID here point to the same chat. dsh-im
-  pushes the answerable prompt immediately; this plugin's checklist is a timeout back-up. See
-  Chinese README §3.1 for the full setup guide.
+  own deadline. The overdue WeChat message is **minimal**: a **[waiting on you]** section listing
+  just the session name and event, and a **[finished]** section spelling out "session「X」finished".
+  No question text / numbered options / long setup prose in the message any more.
+- "Reply directly in WeChat" is powered by **dsh-im native synced questions / remote approvals**,
+  NOT by this plugin parsing replies: dsh-im listens to `user-questions/request` / `approval/request`
+  and pushes a numbered option card to a WeChat private chat as soon as the question appears.
+  One-time setup: enable two-way sync in dsh-im (General → Delivery), then `/sessionlist` and
+  `/session <id>` in the chat to bind it to the current session. That card arrives immediately,
+  not after the 60s timeout; this plugin's timeout message is only a minimal fallback — **do not
+  reply under it**. See Chinese README §3.1.
 - Umbrella bundle: one `insert` mounts two loader rows; dsh-im keeps an upgradeable `^5.10.0`
   range and stays on the npm official source.
 
@@ -55,8 +65,8 @@ buttons to verify.
 
 | Part | Source | Role |
 | --- | --- | --- |
-| WeChat Session Bridge (this package) | `lib/index.js` + `lib/client.js` | watches all sessions, desktop toasts + sound, per-class timeout batches (60s / 30s), checklist WeChat messages, settings page, click-to-jump |
-| `@xmanrui/dsh-im` | npm official source, `^5.10.0` | regular WeChat bot that delivers the timeout checklist; its two-way sync can also post answerable prompts and write your reply back to DSH |
+| WeChat Session Bridge (this package) | `lib/index.js` + `lib/client.js` | watches all sessions, one in-app floating card + sound (no OS toasts), per-class timeout batches (60s / 30s), minimal WeChat reminders, card-grouped settings page, click-to-jump |
+| `@xmanrui/dsh-im` | npm official source, `^5.10.0` | regular WeChat bot that delivers the minimal timeout reminder; its native synced questions / remote approvals post answerable numbered option cards and write your reply back to DSH |
 
 ## Development
 
@@ -71,9 +81,19 @@ CI: `.github/workflows/test.yml` runs the smoke test on push/PR (Node 24, action
 no `NPM_TOKEN` needed. `.github/workflows/sync-gitee.yml` mirrors `main` and tags to Gitee on every
 push (needs the repository secret `GITEE_SSH_PRIVATE_KEY`).
 
-Current version: **1.6.0**.
+Current version: **1.7.0**.
 
-> Unreleased local change (not part of the published 1.6.0): WeChat fallback now uses per-class
-> timeouts (choice/approval 60s, task-finished 30s) and sends a checklist with question text and
-> numbered options (see §3.1 of the Chinese README). It is applied locally only; a new version
-> will be published once the behavior is confirmed.
+**v1.7.0 highlights**: ① desktop alerts are now a **single bottom-right in-app floating card**
+(no system notification permission needed, visible even from another session); the OS banner was
+removed so there is only one popup on screen; ② the settings page was regrouped into cards with a
+short expandable description; ③ WeChat fallback uses per-class timeouts (choice/approval 60s,
+task-finished 30s), each batch fired at its own deadline; ④ the WeChat message was cut from a
+question+options+setup wall of text down to a minimal reminder ([WAITING]/[FINISHED], session name
+only); ⑤ "reply 1 in WeChat" is handled by **dsh-im native synced questions** (one-time
+`/sessionlist` → `/session <id>` binding), and this plugin's timeout message explicitly says not to
+reply under it. See `docs/RELEASE_NOTES_v1.7.0.md`.
+
+**v1.6.0 highlights**: ignored Mnemon background delegated/subagent sessions; fixed the
+background "no popup, no sound" case; switched CI to npm trusted publishing (OIDC / provenance) and
+GitHub main → Gitee auto-sync; filled repository Topics and submitted the marketplace listing PR.
+See `docs/RELEASE_NOTES_v1.6.0.md` and §9 of the Chinese README.
