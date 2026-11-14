@@ -3,6 +3,37 @@
 本文件记录 dsh-plugin-wechat-session（微信会话互通 · 聚合包）的版本更迭。
 全部条目用中文书写。
 
+## v1.8.0（2026-11-13）— 选项1：多会话 ↔ 单一微信实时交互
+
+目标：把多个 DSH 会话跟单一微信号（微信 clawtbot）联通，可直接在微信上实时交互。
+源码调研确认：dsh-im 微信通道本质「一个私聊 ↔ 一个 DSH 会话」1:1（state-store.mjs
+`sessions['p2p:<userId>']=sessionId` 单值、resolveConversationKey matches>1 返回 null、
+normalizeDeliveryTarget 强制单 conversationKey），无法「同时并行」绑定多个会话；
+微信渠道对插件自发的消息也不开放入站订阅（consumeInbound 只对飞书/Lark 开放）。
+故按「不重复造轮子」采用**选项1：全会话实时分标签推送 + /session 串行切换**：
+
+- 下行（全会话实时）：新增 `realtimePush` 开关（默认关，零副作用）。开启后
+  `evalUiStatus` 的 question / approval / done 三个状态边沿，除原有「浮层 + 超时批次」
+  外，各自再立刻调一次 `pushRealtime()`，把带**会话名 + 会话 ID + `/session <会话ID>`
+  切换命令**的极简微信推到同一个私聊——任一会话一有动静，微信里马上分标签可见，
+  不用等 60/30 秒超时。子代理会话仍静默、seed 基线不补发。
+- 上行（串行切换）：`/session <会话ID>` 是 dsh-im 原生入站命令，uiSession 的 sid 即
+  sessionId 可直接作参数。用户在微信里发 `/session <想要的那条会话ID>` 即可切过去
+  继续聊；dsh-im 双向同步（deliverModelAnswers）把该会话回答全文回投——这就是闭环。
+  回答全文 / 选项卡全部沿用 dsh-im，不在插件里自建拉取/解析。
+- 投递链路零改动：把 `sendWechat()` 拆成低层 `postWechat(note)`（唯一 fetch，仍走
+  Host `/__dsh-plugin-wechat-session/wechat` 路由、body 仍是 `{title,desp,botId,targetId}`）
+  与带门禁的 `sendWechat()`（保留 v1.7.0 行为）；`pushRealtime` 与新的
+  `testRealtime` 都复用 `postWechat`，不新增第二个 fetch。
+- 设置页新增「多会话 · 实时推送（选项1）」卡片（开关 + 测试按钮）；
+  `wechatSyncGuide` 补「开启双向同步并投递模型回答」与「多会话靠 /session 切换」两段指引；
+  `debug()` / 全局 API 增加 `realtimePush` 与 `testRealtime()`。
+- 冒烟测试从 54 项扩到 57 项：源码级（默认关 / postWechat / pushRealtime /
+  /session 命令 / 卡片 / 测试函数）+ 行为级（开启后 question、done 边沿各立刻 +1 条、
+  含会话名/会话 ID/切换命令、子代理静默、关掉开关不发）。
+
+验证：`node --check` 三文件通过；`node smoke/smoke-test.mjs` → 全部通过：57 项断言。
+
 ## v1.7.0（2026-11-12）
 
 桌面提醒形态、设置页与微信内容的一次集中整理（相对 v1.6.0）。全部在本机实测通过后发版。

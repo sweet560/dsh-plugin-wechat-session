@@ -20,7 +20,7 @@ function ok(label) { passed += 1; console.log('  ✓ ' + label); }
 // ───────────────────── 1. 清单 / 静态文件 ─────────────────────
 const pkg = await readJson('package.json');
 assert.equal(pkg.name, 'dsh-plugin-wechat-session');
-assert.equal(pkg.version, '1.7.0');
+assert.equal(pkg.version, '1.8.0');
 assert.equal(pkg.type, 'module');
 assert.equal(pkg.main, 'lib/index.js');
 assert.equal(pkg.icon, 'icon.svg');
@@ -30,7 +30,7 @@ assert.equal(pkg.dsh.client.platform, 'web');
 assert.ok(Array.isArray(pkg.dsh.client.inject) && pkg.dsh.client.inject.length >= 1);
 assert.equal(pkg.exports['.'], './lib/index.js');
 assert.equal(pkg.exports['./client'], './lib/client.js');
-ok('package.json 基本字段与 dsh 声明（v1.7.0 唯一浮层弹窗 + 卡片式设置页 + 会话级聚合包）');
+ok('package.json 基本字段与 dsh 声明（v1.8.0 全会话实时分标签推送 + /session 串行切换）');
 
 // 聚合包：声明可升级范围的 dsh-im 直接依赖，装伞包自动带上微信机器人
 assert.ok(pkg.dependencies?.['@xmanrui/dsh-im'], '缺少 @xmanrui/dsh-im 依赖');
@@ -977,5 +977,79 @@ assert.match(clientSrc, /sectionHintShort/, '顶部说明应收成简短副标�
 assert.match(clientSrc, /detailsLabel/, '完整说明应可展开（不再一上来一大段文字墙）');
 assert.doesNotThrow(() => section.render(), '重排后的设置页渲染工厂应无异常');
 ok('回归【m05207②】：设置页重排成卡片式分组（5 组 + 可展开说明 + 主次按钮），渲染无异常');
+
+// ── 新增【v1.8.0 选项1】：全会话实时分标签推送 + /session 串行切换 ──
+// 目标：多个 DSH 会话 ↔ 单一微信私聊，直接在微信上实时交互。
+// 一个微信私聊在 dsh-im 里任一时刻只能绑 1 个 DSH 会话，故走「选项1」：
+//   下行 = 全会话状态变化立刻（不等超时）分标签推同一私聊，带会话 ID 与
+//          /session 切换命令；上行 = 用户在微信发 dsh-im 原生 /session 切会话。
+//   回答全文 / 选项卡沿用 dsh-im 双向同步，不重复造轮子。
+// ① 源码级：默认关、复用 postWechat、边沿接线、切换命令、设置页卡片。
+assert.match(clientSrc, /realtimePush:\s*false/, 'DEFAULTS 里 realtimePush 默认关（零副作用）');
+assert.match(clientSrc, /function postWechat\(/, '应有复用 Host /wechat 路由的低层 postWechat');
+assert.match(clientSrc, /function summarizeRealtime\(/, '应有分标签拼装 summarizeRealtime');
+assert.match(clientSrc, /function pushRealtime\(/, '应有全会话实时推送入口 pushRealtime');
+assert.match(clientSrc, /pushRealtime\([\s\S]{0,80}?sid/, '两个状态边沿都应把 sid 传给 pushRealtime');
+assert.match(clientSrc, /\/session \{id\}/, '实时微信应带 /session <会话ID> 切换命令模板');
+assert.match(clientSrc, /groupRealtime/, '设置页应有「多会话·实时推送」卡片');
+assert.match(clientSrc, /function testRealtime\(/, '设置页/全局 API 应有实时推送测试函数');
+assert.equal(fakeWindow.__dshPluginWechatSession.config.realtimePush, false,
+  'v1.8.0 新开关默认关，保证 54 项旧断言零漂移');
+ok('新增【v1.8.0①】：源码级（默认关 / postWechat / pushRealtime / /session 命令 / 设置页卡片 / 测试函数）齐备');
+
+// ② 行为级：开启后，任意会话 question 边沿「立刻」发 1 条分标签实时微信
+//    （不等 60 秒超时），含会话名 / 会话 ID / /session 切换命令。
+store.set('dshPluginWechatSession.config', JSON.stringify({
+  enabled: true, botId: 'wx_rt_bot', targetId: 'tgt_rt_target',
+  timeoutSec: 30, attentionTimeoutSec: 60, sound: false, volume: 0.5,
+  wechatEnabled: true, notifyPermission: true, realtimePush: true,
+}));
+setAway(false);
+setSessions('sA', { sRT: { displayTitle: '实时会话A' } });
+drainBatch();                                   // 排空前面测试残留批次，增量才干净
+const fRT0 = fetchCalls.length;
+pushStatus(new Map([
+  ['sA', { running: true }],
+  ['sRT', { running: true, pendingInteraction: { kind: 'question', key: 'kRT', question: '选 A 还是 B？' }, completionUnread: false }],
+]));
+assert.equal(fetchCalls.length, fRT0 + 1, '开启后 question 边沿应立刻发 1 条实时微信（不等超时）');
+const rtBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
+assert.match(rtBody.desp, /会话「实时会话A」/, '实时微信应带会话标签（分标签）');
+assert.match(rtBody.desp, /会话 ID：sRT/, '实时微信应带会话 ID');
+assert.match(rtBody.desp, /\/session sRT/, '实时微信应带 /session <会话ID> 切换命令');
+assert.match(rtBody.title, /等你处理|DSH/, '实时微信应有清晰标题');
+ok('新增【v1.8.0②】：开启后全会话 question 边沿立刻推 1 条分标签微信（会话名 + 会话 ID + /session 命令）');
+
+// ③ done 边沿同样立刻推一条（带「已完成」标题）；子代理静默；关掉开关后不发。
+const fRT1 = fetchCalls.length;
+pushStatus(new Map([
+  ['sA', { running: true }],
+  ['sRT', { running: false, completionUnread: true }],   // completionUnread 上升沿 → done 边沿
+]));
+assert.equal(fetchCalls.length, fRT1 + 1, 'done 边沿也应立刻发 1 条实时微信');
+const rtDone = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
+assert.match(rtDone.title, /已完成|DSH/, 'done 实时微信标题应标明已完成');
+assert.match(rtDone.desp, /\/session sRT/, 'done 实时微信同样带 /session 切换命令');
+
+setSessions('sA', { sSub: { origin: 'subagent' } });
+const fRT2 = fetchCalls.length;
+pushStatus(new Map([
+  ['sA', { running: true }],
+  ['sSub', { running: true, pendingInteraction: { kind: 'question', key: 'kSub' }, completionUnread: false }],
+]));
+assert.equal(fetchCalls.length, fRT2, '子代理会话不应触发实时推送（isIgnoredSession 静默）');
+
+store.set('dshPluginWechatSession.config', JSON.stringify({
+  enabled: true, botId: 'wx_rt_bot', targetId: 'tgt_rt_target',
+  timeoutSec: 30, attentionTimeoutSec: 60, sound: false, volume: 0.5,
+  wechatEnabled: true, notifyPermission: true, realtimePush: false,
+}));
+const fRT3 = fetchCalls.length;
+pushStatus(new Map([
+  ['sA', { running: true }],
+  ['sOff', { running: true, pendingInteraction: { kind: 'question', key: 'kOff' }, completionUnread: false }],
+]));
+assert.equal(fetchCalls.length, fRT3, 'realtimePush 关掉后不应再发实时微信');
+ok('新增【v1.8.0③】：done 边沿也推 / 子代理静默 / 关掉开关不发，选项1 默认零副作用');
 
 console.log(`\n全部通过：${passed} 项断言。`);

@@ -81,7 +81,20 @@ CI: `.github/workflows/test.yml` runs the smoke test on push/PR (Node 24, action
 no `NPM_TOKEN` needed. `.github/workflows/sync-gitee.yml` mirrors `main` and tags to Gitee on every
 push (needs the repository secret `GITEE_SSH_PRIVATE_KEY`).
 
-Current version: **1.7.0**.
+Current version: **1.8.0**.
+
+**v1.8.0 highlights (Option 1: multiple DSH sessions ↔ a single WeChat account, realtime)**: ① new
+"Full-session realtime push" switch (**off by default** — behaviour is identical to v1.7.0 when off);
+② when on, any DSH session's question / approval / done edge **immediately** pushes a minimal,
+session-tagged WeChat message (session name + session ID + `/session <sessionId>` switch command)
+to the same chat, without waiting for the 60/30s timeout; ③ send the native dsh-im command
+`/session <sessionId>` in WeChat to switch the chat to that session and keep talking, with dsh-im
+two-way sync ("deliver model answers") pushing the full answers back — **multiple DSH sessions
+serially share one single WeChat account**; ④ delivery path unchanged: `sendWechat()` was split into
+a low-level `postWechat()` (still the only fetch, same Host route / same body contract), reused by
+both realtime push and the "Test realtime push" button; ⑤ no self-built full-answer fetching in the
+client (avoids patching Host subscriptions / internal RPCs that break on upgrade). Smoke tests
+54 → 57 assertions. See `docs/RELEASE_NOTES_v1.8.0.md`.
 
 **v1.7.0 highlights**: ① desktop alerts are now a **single bottom-right in-app floating card**
 (no system notification permission needed, visible even from another session); the OS banner was
