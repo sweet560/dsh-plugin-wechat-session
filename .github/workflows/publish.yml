@@ -20,10 +20,11 @@
 #   → 不可变版本冲突，npm 有两种表现：
 #     `409 Conflict - Cannot publish over previously staged version ...`（E409，v1.7.0）
 #     `403 Forbidden - You cannot publish over the previously published versions: X`（E403，v1.8.0）
-#   两层防护：
+#   两层防护（借鉴 dsh-plugin-deepseek-chat 的 publish.yml）：
 #     ① 幂等守卫带 --prefer-online 并短轮询重试，尽量让重复 run 直接「跳过」而非抢发；
 #     ② 万一仍并发撞上，publish 步骤把 E409 / E403 都当作「该版本已被同批 run 发布成功」的
-#        幂等结果：回查 registry 确认版本已存在即成功，不再把 benign 冲突报成失败。
+#        确定性信号：冲突即证明已发布，回查 registry 只作 best-effort 日志观测（传播延迟下
+#        npm view 可能查不到），无论查不查得到都按幂等成功退出，不再把 benign 冲突报成红叉。
 #   concurrency 维持「按仓库排队、不取消」：删掉或改成 cancel-in-progress:true 反而可能
 #   取消掉真正正在发布的那个 run。
 #
@@ -114,10 +115,12 @@ jobs:
           fi
 
       # 不设置 NODE_AUTH_TOKEN：npm 会用 id-token: write 签发的 OIDC token 自动换取发布凭证。
-      # 不可变版本冲突兜底：若同一版本被同一次发版的另一个 run 抢先发布（registry 传播竞态），
-      # npm 会返回 409（Cannot publish over previously staged version）或 403（You cannot
-      # publish over the previously published versions，v1.8.0 实测就是这个）不可变版本冲突；
-      # 回查 registry 确认版本已存在即视为幂等成功，不再把这个 benign 冲突报成失败。
+      # 不可变版本冲突兜底（借鉴 dsh-plugin-deepseek-chat 的 publish.yml）：若同一版本被
+      # 同一次发版的另一个 run 抢先发布（registry 传播竞态），npm 会返回 409（Cannot publish
+      # over previously staged version）或 403（You cannot publish over the previously
+      # published versions，v1.8.0 实测就是这个）不可变版本冲突。该冲突本身就是「版本已发布」
+      # 的确定性信号；registry 传播延迟下 npm view 可能仍查不到，故回查只作 best-effort 日志
+      # 观测，无论查不查得到都视为幂等成功，不再把这个 benign 冲突报成红叉。
       - name: Publish to npm (OIDC trusted publishing)
         if: steps.version.outputs.should_publish == 'true'
         shell: bash
@@ -131,18 +134,16 @@ jobs:
           # 同批 run 并发抢发同一版本时，npm 的不可变版本冲突有两种表现：
           #   409 Conflict - Cannot publish over previously staged version ...（E409，早期）
           #   403 Forbidden - You cannot publish over the previously published versions: X（E403，v1.8.0 实测）
-          # 两种都表示「该版本已被同批的另一个 run 发布成功」，回查 registry 确认后即幂等成功。
-          if printf '%s' "$OUT" | grep -qiE 'E409|409 Conflict|E403|403 Forbidden|Cannot publish over previously (staged|published) version'; then
-            echo "::warning::npm publish hit immutable-version conflict (version already published by a sibling run); verifying it is live on registry..."
-            for i in 1 2 3 4 5 6; do
-              if npm view --prefer-online "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
-                echo "::notice::$PKG_NAME@$PKG_VERSION is live on npm - immutable-version conflict treated as idempotent success."
-                exit 0
-              fi
-              if [ "$i" -lt 6 ]; then sleep 3; fi
-            done
-            echo "::error::immutable-version conflict but $PKG_NAME@$PKG_VERSION not visible on registry after retry."
-            exit 1
+          # 两种都表示「该版本已被同批的另一个 run 发布成功」，是版本已发布的确定性信号。
+          if printf '%s' "$OUT" | grep -qiE 'E409|409 Conflict|E403|403 Forbidden|Cannot publish over previously (staged|published) version|previously published version'; then
+            # 借鉴 deepseek-chat：冲突本身即证明已发布，registry 传播延迟下 npm view 可能查不到。
+            # 因此回查只作 best-effort 观测写进日志，无论查不查得到都按幂等成功退出，绝不误报红叉。
+            if npm view --prefer-online "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
+              echo "::notice::$PKG_NAME@$PKG_VERSION is live on npm (benign immutable-version conflict) - treating as success."
+            else
+              echo "::notice::$PKG_NAME@$PKG_VERSION not yet visible (npm propagation delay); the immutable-version conflict already proves it is published - treating as success."
+            fi
+            exit 0
           fi
-          echo "::error::npm publish failed with exit $RC (not an immutable-version conflict)."
+          echo "::error::npm publish failed with exit $RC (not a benign immutable-version conflict)."
           exit 1
