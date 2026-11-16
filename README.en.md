@@ -1,4 +1,4 @@
-# dsh-plugin-wechat-session (WeChat Session Bridge · Umbrella Bundle)
+# dsh-plugin-wechat-session (WeChat Session Bridge)
 
 A reminder plugin for the **DeepSeek Harness desktop app**. It watches all your running
 sessions and links desktop alerts with a WeChat fallback.
