@@ -20,7 +20,7 @@ function ok(label) { passed += 1; console.log('  ✓ ' + label); }
 // ───────────────────── 1. 清单 / 静态文件 ─────────────────────
 const pkg = await readJson('package.json');
 assert.equal(pkg.name, 'dsh-plugin-wechat-session');
-assert.equal(pkg.version, '1.8.0');
+assert.equal(pkg.version, '1.9.0');
 assert.equal(pkg.type, 'module');
 assert.equal(pkg.main, 'lib/index.js');
 assert.equal(pkg.icon, 'icon.svg');
@@ -30,7 +30,7 @@ assert.equal(pkg.dsh.client.platform, 'web');
 assert.ok(Array.isArray(pkg.dsh.client.inject) && pkg.dsh.client.inject.length >= 1);
 assert.equal(pkg.exports['.'], './lib/index.js');
 assert.equal(pkg.exports['./client'], './lib/client.js');
-ok('package.json 基本字段与 dsh 声明（v1.8.0 全会话实时分标签推送 + /session 串行切换）');
+ok('package.json 基本字段与 dsh 声明（v1.9.0 功能融合：超时发富格式卡 + /session 串行切换）');
 
 // 聚合包：声明可升级范围的 dsh-im 直接依赖，装伞包自动带上微信机器人
 assert.ok(pkg.dependencies?.['@xmanrui/dsh-im'], '缺少 @xmanrui/dsh-im 依赖');
@@ -580,10 +580,13 @@ batchTimer().fn();
 assert.equal(fetchCalls.length, fetchBefore + 1, '前台超时也应发微信');
 const sentBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(fetchCalls[fetchCalls.length - 1].url, '/__dsh-plugin-wechat-session/wechat');
-assert.equal(sentBody.title, 'DSH 需要你看一下');
+assert.equal(sentBody.title, '', '功能融合后富格式卡 title 留空（整段作 desp）');
+assert.match(sentBody.desp, /【 授予权限 】/, '需确认类富格式卡应带【 授予权限 】状态标签');
+assert.match(sentBody.desp, /Bash/, '富格式卡正文应带具体工具名');
+assert.match(sentBody.desp, /\/session sB /, '富格式卡应带 /session 切换命令');
 assert.ok('botId' in sentBody && 'targetId' in sentBody, '转发体应带 botId/targetId');
 assert.ok(!('sendKey' in sentBody), '转发体不应再有 sendKey');
-ok('回归：前台 30 秒没切过去看/没处理 → 汇总成一条微信经 Host 转发');
+ok('回归：前台超时没切过去看/没处理 → 发富格式微信卡（授予权限 + 会话 ID + /session 切换）');
 
 // 回归【用户决策①】：正盯着的 sA 自己需要选择 → 保持安静（不弹、不起批次）。
 const notesBefore2 = createdNotifications.length;
@@ -889,17 +892,18 @@ pushStatus(new Map([
 assert.equal(batchTimeouts.length, tAsk0 + 1, 'question 应起一个微信批次');
 assert.equal(batchTimer().ms, 60000, '需选择/确认类独立超时 = 60 秒');
 batchTimer().fn();
-assert.equal(fetchCalls.length, fAsk0 + 1, '极简提醒应发一条微信');
-const despAsk = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
-assert.match(despAsk, /【等你处理】/, '应有「等你处理」标题');
-assert.match(despAsk, /会话「发布方案评审」/, '应写清是哪条会话');
-assert.ok(!/用哪种发布通道？/.test(despAsk), '极简版不应再堆问题原文');
-assert.ok(!/1\) npm/.test(despAsk), '极简版不应再列编号选项');
-assert.ok(!/微信回/.test(despAsk), '极简版不应再给「回编号即可」的误导话术');
-assert.ok(!/双向同步/.test(despAsk), '极简版不应再塞绑定长文（已移到设置页）');
-assert.ok(despAsk.split('\n').filter(Boolean).length <= 6, '整条微信应短、干净、不成为文字墙');
+assert.equal(fetchCalls.length, fAsk0 + 1, '超时到期后发 1 条富格式卡');
+const askBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
+assert.equal(askBody.title, '', '富格式卡 title 留空');
+const despAsk = askBody.desp;
+assert.match(despAsk, /会话「发布方案评审」【 需要选择 】/, '富格式卡首行应带会话名 + 状态标签');
+assert.match(despAsk, /\/session sAsk /, '富格式卡应带 /session 切换命令');
+assert.match(despAsk, /📌 正文：用哪种发布通道？/, '富格式卡正文应带具体问题');
+assert.match(despAsk, /选项1：npm/, '富格式卡应读真实编号选项');
+assert.match(despAsk, /选项2：Gitee Release/, '富格式卡应列出第二个编号选项');
+assert.match(despAsk, /—— 本条为实时状态提醒，勿在此回复 ——/, '富格式卡应带统一脚注');
 assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, null, '发完后批次应清空');
-ok('回归【m04774②】：需选择类 60 秒超时只发干净极简提醒（会话名 + 一句别回复），不再堆文字墙');
+ok('功能融合：需选择类 60 秒超时发富格式卡（状态标签 + 正文 + 编号选项 + /session 切换）');
 
 // B. 任务跑完类：沿用 timeoutSec = 30 秒，极简微信里【已完成】段突出「哪个会话完成了」。
 setSessions('sA', { sFin: { displayTitle: '周报生成' } });
@@ -917,10 +921,18 @@ assert.equal(batchTimeouts.length, tFin0 + 1, 'done 应起一个微信批次');
 assert.equal(batchTimer().ms, 30000, '任务跑完类仍用 timeoutSec = 30 秒');
 batchTimer().fn();
 assert.equal(fetchCalls.length, fFin0 + 1, 'done 应发一条微信');
-const despFin = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
-assert.match(despFin, /【已完成】/, '极简微信应有「已完成」段');
-assert.match(despFin, /会话「周报生成」已完成/, '应一眼看出是哪个会话完成了');
-ok('回归【m03992 / m04774②】：任务跑完类仍 30 秒，极简微信【已完成】段突出「会话「XXX」已完成」');
+const finBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
+assert.equal(finBody.title, '', 'done 富格式卡 title 留空');
+const despFin = finBody.desp;
+const finLines = despFin.split('\n\n');
+assert.equal(finLines.length, 6, 'done 富格式卡应为 6 段');
+assert.match(finLines[0], /^DeepSeek Harness · 会话「周报生成」【 已完成 】 \d{2}:\d{2}:\d{2}$/, 'done 卡首行逐字');
+assert.equal(finLines[1], '▸ 在微信里发送：', 'done 卡第 2 行逐字');
+assert.equal(finLines[2], '/session sFin ', 'done 卡第 3 行逐字（行尾带空格）');
+assert.equal(finLines[3], '即可切到该会话继续对话。 ', 'done 卡第 4 行逐字（行尾带空格）');
+assert.equal(finLines[4], '📌 正文：任务已跑完，切过去查看回答全文', 'done 卡第 5 行正文引导逐字');
+assert.equal(finLines[5], '—— 本条为实时状态提醒，勿在此回复 ——', 'done 卡第 6 行脚注逐字');
+ok('功能融合：任务跑完类 30 秒超时发富格式卡（6 段逐字 + title 留空）');
 
 // C. 两类混在一批：计时器对准最早 deadline，到点只发到期项，未到期项
 //    留在批次里重排（不被提前一起发掉）——这是双超时不串台的关键。
@@ -941,16 +953,20 @@ assert.ok(batchTimer().ms <= 30000 && batchTimer().ms > 29000,
   '混批计时器应对准最早那条 deadline（done 的 ~30 秒，不是 60 秒）');
 batchTimer().fn();                                    // 只发到期的 done
 assert.equal(fetchCalls.length, fMix0 + 1, '第一次只发到期项');
-const despMix1 = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
-assert.match(despMix1, /【已完成】/, '第一次应只含「已完成」');
-assert.ok(!/【等你处理】/.test(despMix1), '未到期的 question 不该被提前发掉');
+const mixBody1 = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
+assert.equal(mixBody1.title, '');
+const despMix1 = mixBody1.desp;
+assert.match(despMix1, /会话「任务甲」【 已完成 】/, '第一次应只发到期的 done 富格式卡');
+assert.ok(!/【 需要选择 】/.test(despMix1), '未到期的 question 不该被提前发掉');
 assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, 1, '未到期项应留在批次里继续等');
 batchTimer().fn();                                    // 发剩下到期的 question
 assert.equal(fetchCalls.length, fMix0 + 2, '第二次发剩下的 question');
-const despMix2 = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp;
-assert.match(despMix2, /【等你处理】/, '第二次应含极简「等你处理」提醒');
+const mixBody2 = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
+assert.equal(mixBody2.title, '');
+const despMix2 = mixBody2.desp;
+assert.match(despMix2, /会话「任务乙」【 需要选择 】/, '第二次应含 question 富格式卡');
 assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, null, '全发完后批次应清空');
-ok('回归【m03992】：两类混批按各自 deadline 分次发，30 秒的先发、60 秒的留到下一次，不串台');
+ok('功能融合：两类混批按各自 deadline 分次发富格式卡，30 秒的先发、60 秒的留到下一次，不串台');
 
 // ── 回归【m05207】：只留一个弹窗 + 设置页卡片式分组 ──
 // 用户反馈「浮层 + OS 横幅两个弹窗太复杂」「设置界面太丑」。按决策：
@@ -991,63 +1007,69 @@ assert.match(clientSrc, /realtimePush:\s*false/, 'DEFAULTS 里 realtimePush 默�
 assert.match(clientSrc, /function postWechat\(/, '应有复用 Host /wechat 路由的低层 postWechat');
 assert.match(clientSrc, /function summarizeRealtime\(/, '应有分标签拼装 summarizeRealtime');
 assert.match(clientSrc, /function pushRealtime\(/, '应有全会话实时推送入口 pushRealtime');
-assert.match(clientSrc, /pushRealtime\([\s\S]{0,80}?sid/, '两个状态边沿都应把 sid 传给 pushRealtime');
+assert.match(clientSrc, /pushRealtime\([\s\S]{0,80}?sid/, 'fireBatchTimeout 应把 sid 逐条传给 pushRealtime');
 assert.match(clientSrc, /\/session \{id\}/, '实时微信应带 /session <会话ID> 切换命令模板');
-assert.match(clientSrc, /groupRealtime/, '设置页应有「多会话·实时推送」卡片');
+assert.ok(!/card\(t\('groupRealtime'\)/.test(clientSrc), '功能融合：设置页独立的「多会话·实时推送」卡片渲染已删除');
 assert.match(clientSrc, /function testRealtime\(/, '设置页/全局 API 应有实时推送测试函数');
 assert.equal(fakeWindow.__dshPluginWechatSession.config.realtimePush, false,
   'v1.8.0 新开关默认关，保证 54 项旧断言零漂移');
-ok('新增【v1.8.0①】：源码级（默认关 / postWechat / pushRealtime / /session 命令 / 设置页卡片 / 测试函数）齐备');
+ok('功能融合【v1.8.0①】：源码级（postWechat / summarizeRealtime / pushRealtime 门禁 / /session 命令）齐备，实时卡已融合进超时发送');
 
-// ② 行为级：开启后，任意会话 question 边沿「立刻」发 1 条分标签实时微信
-//    （不等 60 秒超时），含会话名 / 会话 ID / /session 切换命令。
+// ── 功能融合【v1.8.0②/③】：富格式卡改为「超时到期后」发送 ──
+// 用户要求功能融合：设置页只留超时设置；任务完成/需要选择/授予权限三类卡片沿用
+// 原实时推送的富格式卡内容，但触发从「边沿即时」改为「超时到期后 fireBatchTimeout 逐条发」。
 store.set('dshPluginWechatSession.config', JSON.stringify({
   enabled: true, botId: 'wx_rt_bot', targetId: 'tgt_rt_target',
   timeoutSec: 30, attentionTimeoutSec: 60, sound: false, volume: 0.5,
-  wechatEnabled: true, notifyPermission: true, realtimePush: true,
+  wechatEnabled: true, notifyPermission: true,
 }));
 setAway(false);
 setSessions('sA', { sRT: { displayTitle: '实时会话A' } });
-drainBatch();                                   // 排空前面测试残留批次，增量才干净
+drainBatch();                                   // 排空残留批次
 const fRT0 = fetchCalls.length;
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sRT', { running: true, pendingInteraction: { kind: 'question', key: 'kRT', question: '选 A 还是 B？' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fRT0 + 1, '开启后 question 边沿应立刻发 1 条实时微信（不等超时）');
+assert.equal(fetchCalls.length, fRT0, '功能融合：question 边沿不再立即发卡（改为超时到期后）');
+assert.equal(batchTimer().ms, 60000, '需选择类仍是 60 秒超时');
+batchTimer().fn();                              // 超时到期 → 发富格式卡
+assert.equal(fetchCalls.length, fRT0 + 1, '超时到期后发 1 条富格式卡');
 const rtBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
-assert.equal(rtBody.title, '', 'question 卡 title 留空（与 done 卡同款，整段作 desp）');
+assert.equal(rtBody.title, '', '富格式卡 title 留空（整段作 desp）');
 const rtQ = rtBody.desp.split('\n\n');
-assert.equal(rtQ.length, 6, 'question 卡应为 6 段（首行 + 指引 3 行 + 问题 + 脚注）');
+assert.equal(rtQ.length, 6, 'question 富格式卡应为 6 段');
 assert.match(rtQ[0], /^DeepSeek Harness · 会话「实时会话A」【 需要选择 】 \d{2}:\d{2}:\d{2}$/,
-  'question 卡首行逐字（同款状态标签 + HH:MM:SS）');
-assert.equal(rtQ[1], '▸ 在微信里发送：', '指引在问题之前：第 2 行');
+  'question 卡首行逐字（状态标签 + HH:MM:SS）');
+assert.equal(rtQ[1], '▸ 在微信里发送：', '指引第 2 行');
 assert.equal(rtQ[2], '/session sRT ', '指引 /session 行（行尾带空格）');
 assert.equal(rtQ[3], '即可切到该会话继续对话。 ', '指引第 4 行（行尾带空格）');
-assert.equal(rtQ[4], '📌 正文：选 A 还是 B？', '正文段开头带醒目标记，独立一段');
+assert.equal(rtQ[4], '📌 正文：选 A 还是 B？', '正文段独立成段');
 assert.equal(rtQ[5], '—— 本条为实时状态提醒，勿在此回复 ——', '统一脚注');
-assert.ok(!/会话 ID：/.test(rtBody.desp), '新样式不再单列「会话 ID：」行（/session 行已给出 ID）');
-ok('新增【v1.8.0②】：question 卡与 done 卡同款骨架 + 行间空行分段 + 具体问题独立成段');
+ok('功能融合②：question 富格式卡超时到期后才发，6 段逐字');
 
-// ③ done 边沿同样立刻推一条（带「已完成」标题）；子代理静默；关掉开关后不发。
+// done 边沿同样超时后发（6 行逐字）；子代理静默；关微信开关不发
 const fRT1 = fetchCalls.length;
 pushStatus(new Map([
   ['sA', { running: true }],
-  ['sRT', { running: false, completionUnread: true }],   // completionUnread 上升沿 → done 边沿
+  ['sRT', { running: false, completionUnread: true }],   // done 上升沿
 ]));
-assert.equal(fetchCalls.length, fRT1 + 1, 'done 边沿也应立刻发 1 条实时微信');
+assert.equal(fetchCalls.length, fRT1, 'done 边沿也不立即发');
+assert.equal(batchTimer().ms, 30000, '任务跑完类仍是 30 秒超时');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fRT1 + 1, '超时到期后发 done 富格式卡');
 const rtDone = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
-assert.equal(rtDone.title, '', 'done 卡 title 留空（整段作 desp，Host 才不会插空行）');
+assert.equal(rtDone.title, '', 'done 卡 title 留空');
 const rtDoneLines = rtDone.desp.split('\n\n');
 assert.equal(rtDoneLines.length, 6, 'done 卡应恰为 6 行');
 assert.match(rtDoneLines[0], /^DeepSeek Harness · 会话「实时会话A」【 已完成 】 \d{2}:\d{2}:\d{2}$/,
-  'done 卡第 1 行逐字（含【 已完成 】内空格 + HH:MM:SS）');
+  'done 卡首行逐字');
 assert.equal(rtDoneLines[1], '▸ 在微信里发送：', 'done 卡第 2 行逐字');
 assert.equal(rtDoneLines[2], '/session sRT ', 'done 卡第 3 行逐字（行尾带空格）');
 assert.equal(rtDoneLines[3], '即可切到该会话继续对话。 ', 'done 卡第 4 行逐字（行尾带空格）');
-assert.equal(rtDoneLines[4], '📌 正文：任务已跑完，切过去查看回答全文', 'done 卡第 5 行正文引导逐字');
+assert.equal(rtDoneLines[4], '📌 正文：任务已跑完，切过去查看回答全文', 'done 卡第 5 行逐字');
 assert.equal(rtDoneLines[5], '—— 本条为实时状态提醒，勿在此回复 ——', 'done 卡第 6 行脚注逐字');
-ok('新增【done 卡定制模板】：6 行逐字匹配（含 📌 正文引导）、title 留空、时间为 HH:MM:SS');
+ok('功能融合③：done 富格式卡超时到期后发，6 行逐字');
 
 setSessions('sA', { sSub: { origin: 'subagent' } });
 const fRT2 = fetchCalls.length;
@@ -1055,31 +1077,30 @@ pushStatus(new Map([
   ['sA', { running: true }],
   ['sSub', { running: true, pendingInteraction: { kind: 'question', key: 'kSub' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fRT2, '子代理会话不应触发实时推送（isIgnoredSession 静默）');
+drainBatch();
+assert.equal(fetchCalls.length, fRT2, '子代理会话不应触发富格式卡（isIgnoredSession 静默）');
 
+// 门禁改为微信开关 wechatEnabled（不再是 realtimePush）
 store.set('dshPluginWechatSession.config', JSON.stringify({
   enabled: true, botId: 'wx_rt_bot', targetId: 'tgt_rt_target',
   timeoutSec: 30, attentionTimeoutSec: 60, sound: false, volume: 0.5,
-  wechatEnabled: true, notifyPermission: true, realtimePush: false,
+  wechatEnabled: false, notifyPermission: true,
 }));
+setSessions('sA', { sOff: { displayTitle: '关微信会话' } });
 const fRT3 = fetchCalls.length;
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sOff', { running: true, pendingInteraction: { kind: 'question', key: 'kOff' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fRT3, 'realtimePush 关掉后不应再发实时微信');
-ok('新增【v1.8.0③】：done 边沿也推 / 子代理静默 / 关掉开关不发，选项1 默认零副作用');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fRT3, 'wechatEnabled 关掉后超时到期也不发富格式卡');
+ok('功能融合③：子代理静默 / 关微信开关不发（门禁改用 wechatEnabled）');
 
-// ── 新增【v1.8.0 实时推送短时间去重】：同一会话 + 同一事件 + 同一正文只发一条 ──
-// 真机现象（用户截图）：开关开启时，任务收尾的宿主状态抖动让 done 边沿在短时间
-// 内重复出现，pushRealtime() 原本无记忆直发 → 微信里两条一字不差的「会话已完成」。
-// 修复：pushRealtime() 内用 Map 按「sid + kind + 完整正文」在 60s 窗口去重。
-// 这里用可控虚拟时钟（覆盖宿主 Date.now，vm 沙箱共享同一个 Date 对象）把
-// 「短时间重复」「窗口过期」两种时间尺度都精确复现，不依赖真实等待。
+// ── 功能融合去重：复用 realtimeDedupe 60s 窗口（触发改为 fireBatchTimeout） ──
 store.set('dshPluginWechatSession.config', JSON.stringify({
   enabled: true, botId: 'wx_rt_bot', targetId: 'tgt_rt_target',
   timeoutSec: 30, attentionTimeoutSec: 60, sound: false, volume: 0.5,
-  wechatEnabled: true, notifyPermission: true, realtimePush: true,
+  wechatEnabled: true, notifyPermission: true,
 }));
 setAway(false);
 setSessions('sA', {
@@ -1087,25 +1108,28 @@ setSessions('sA', {
   sDedup: { displayTitle: '去重会话' },
   sDedup2: { displayTitle: '另一会话' },
 });
-drainBatch();                                   // 排空前面测试残留批次，增量才干净
+drainBatch();
 const fD0 = fetchCalls.length;
-let virtualNow = 1_700_000_000_000;             // 固定基准，推进它来模拟窗口过期
+let virtualNow = 1_700_000_000_000;
 const RealDateNow = Date.now;
 Date.now = () => virtualNow;
 
-// ① 同键短时间重复被抑制（贴合真机：done 事件、正文完全相同）
-assert.match(clientSrc, /var REALTIME_DEDUPE_WINDOW_MS = 60 \* 1000/, '去重窗口应定义为 60_000 ms 量级的独立常量');
+// 源码级常量/Map/失败撤销/上限齐备
+assert.match(clientSrc, /var REALTIME_DEDUPE_WINDOW_MS = 60 \* 1000/, '去重窗口常量 60_000 ms');
 assert.match(clientSrc, /var realtimeDedupe = new Map\(\)/, '应有内存去重 Map');
-assert.match(clientSrc, /realtimeDedupe\.delete\(dedupeKey\)/, '发送失败应撤销该键以便下次重试');
-assert.match(clientSrc, /REALTIME_DEDUPE_MAX_KEYS/, '应有 Map 上限 / 过期清理防内存泄漏');
+assert.match(clientSrc, /realtimeDedupe\.delete\(dedupeKey\)/, '发送失败应撤销该键以便重试');
+assert.match(clientSrc, /REALTIME_DEDUPE_MAX_KEYS/, '应有 Map 上限防内存泄漏');
+
+// ① 同一 done 卡 60s 内重复边沿只发一条
 pushStatus(new Map([
   ['sA', { running: true }],
-  ['sDone', { running: false, completionUnread: true }],   // done 上升沿 → 发第 1 条
+  ['sDone', { running: false, completionUnread: true }],
 ]));
-assert.equal(fetchCalls.length, fD0 + 1, 'done 边沿应先发 1 条实时微信');
+assert.equal(fetchCalls.length, fD0, '边沿不立即发');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fD0 + 1, '超时到期发第 1 条 done 卡');
 const dedupeDone = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(dedupeDone.title, '', 'done 卡 title 留空');
-// 期望时间动态算，避免冒烟在别的时区跑时硬编码时刻失配；Date.now 已被虚拟时钟接管。
 const expectedClock = new Date(1_700_000_000_000).toLocaleTimeString('zh-CN');
 const expectedDoneDesp = [
   `DeepSeek Harness · 会话「微信·甜屿林风」【 已完成 】 ${expectedClock}`,
@@ -1115,60 +1139,64 @@ const expectedDoneDesp = [
   '📌 正文：任务已跑完，切过去查看回答全文',
   '—— 本条为实时状态提醒，勿在此回复 ——',
 ].join('\n\n');
-assert.equal(dedupeDone.desp, expectedDoneDesp, 'done 卡在固定虚拟时钟下逐字等于 6 行定制模板');
-pushStatus(new Map([
-  ['sA', { running: true }],
-  ['sDone', { running: false, completionUnread: false }],  // unread 回落：清掉 doneBaseline，不触发边沿
-]));
-assert.equal(fetchCalls.length, fD0 + 1, 'unread 回落不应触发实时推送');
-virtualNow += 2000;   // 跨过 evalUiStatus 里 doneAt 的 1000ms 去抖，但仍在 60s 去重窗口内
-pushStatus(new Map([
-  ['sA', { running: true }],
-  ['sDone', { running: false, completionUnread: true }],   // 状态抖动再次形成 done 边沿
-]));
-assert.equal(fetchCalls.length, fD0 + 1,
-  '同一会话同一 done 事件、正文完全相同：60s 内重复边沿应被去重吞掉，不再发第二条');
-ok('新增【去重①】：同键短时间重复被抑制（done 状态抖动只发 1 条；源码级常量/Map/失败撤销/上限齐备）');
+assert.equal(dedupeDone.desp, expectedDoneDesp, 'done 卡在固定虚拟时钟下逐字等于 6 行模板');
 
-// ② 不同会话 / 不同内容 / 不同事件不受影响（键含 sid + kind + 完整正文）
+pushStatus(new Map([
+  ['sA', { running: true }],
+  ['sDone', { running: false, completionUnread: false }],  // unread 回落清 doneBaseline
+]));
+assert.equal(fetchCalls.length, fD0 + 1, 'unread 回落不应触发富格式卡');
+virtualNow += 2000;   // 跨过 doneAt 的 1000ms 去抖，仍在 60s 去重窗口内
+pushStatus(new Map([
+  ['sA', { running: true }],
+  ['sDone', { running: false, completionUnread: true }],   // 再次形成 done 边沿
+]));
+batchTimer().fn();
+assert.equal(fetchCalls.length, fD0 + 1,
+  '同一会话同一 done 卡、60s 内重复边沿应被去重吞掉，不再发第二条');
+ok('去重①：同键短时间重复被抑制（done 状态抖动只发 1 条）');
+
+// ② 不同会话 / 不同正文 / 不同事件不受影响
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sDedup', { running: true, pendingInteraction: { kind: 'question', key: 'k1', question: '问题甲' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fD0 + 2, '另一会话的 question 边沿应正常发');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fD0 + 2, '另一会话的 question 应正常发');
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sDedup', { running: true, pendingInteraction: { kind: 'question', key: 'k2', question: '问题乙' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fD0 + 3, '同会话同事件但问题正文变了（不同内容）应正常发，不被去重误伤');
-const dedupeQ2 = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
-assert.match(dedupeQ2.desp, /问题乙/, '新问题的正文应出现在实时微信里');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fD0 + 3, '同会话同事件但正文变了应正常发，不被去重误伤');
+assert.match(JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body).desp, /问题乙/, '新问题的正文应出现在富格式卡里');
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sDedup2', { running: true, pendingInteraction: { kind: 'question', key: 'k3', question: '问题甲' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fD0 + 4, '不同会话（键含 sid）不受影响，应正常发');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fD0 + 4, '不同会话（键含 sid）不受影响');
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sDedup', { running: true, pendingInteraction: { kind: 'approval', key: 'k4', question: '确认运行' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fD0 + 5, '不同事件类型（question→approval）不受影响，应正常发');
-ok('新增【去重②】：不同会话 / 不同问题正文 / 不同事件（question→approval）均正常推送，去重零误伤');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fD0 + 5, '不同事件类型（question→approval）不受影响');
+ok('去重②：不同会话 / 不同正文 / 不同事件均正常发，去重零误伤');
 
-// ③ 窗口过期后、内容仍相同也允许再发（并更新时间戳）
-virtualNow += 70_000;   // 相对上一条同键（问题甲，ts=virtualNow 基准+2000）已跨过 60s 窗口
+// ③ 窗口过期后、内容仍相同也允许再发
+virtualNow += 70_000;
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sDedup', { running: true, pendingInteraction: { kind: 'question', key: 'k5', question: '问题甲' }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fD0 + 6, '窗口过期后同一会话同一事件的同一正文应允许再发一条');
-ok('新增【去重③】：60s 窗口过期后同键可再发（不是一次性永久禁用）');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fD0 + 6, '60s 窗口过期后同键可再发');
+ok('去重③：60s 窗口过期后同键可再发（不是一次性永久禁用）');
 
-Date.now = RealDateNow;   // 还原真实时钟，避免影响后续任何代码
+Date.now = RealDateNow;   // 还原真实时钟
 
-// ── 端到端：client 实际产生的 done 卡 body → 真实 Host handler → ctx.dshIm.send ──
-// 钉死「title 留空后 Host 用 title||desp，不再在标题与正文间插空行」，最终发到微信
-// 的 text 逐字等于用户定制的 5 行模板。dedupeDone 是 client 侧 postWechat 的真实 body。
+// ── 端到端：client 富格式卡 body → 真实 Host handler → ctx.dshIm.send ──
 sendCalls.length = 0;
 sendResult = { sent: true };
 sendThrow = null;
@@ -1180,33 +1208,35 @@ const e2eBody = JSON.stringify({
   targetId: dedupeDone.targetId || 'tgt_rt_target',
 });
 const e2eRes = await invoke(wechatRoute.handler, makeReq('POST', e2eBody));
-assert.equal(e2eRes.code, 200, 'done 卡 body 应被 Host 正常受理');
+assert.equal(e2eRes.code, 200, '富格式卡 body 应被 Host 正常受理');
 assert.equal(sendCalls.length, 1, '应调用一次 ctx.dshIm.send');
 assert.equal(sendCalls[0].text, expectedDoneDesp,
-  '最终发到微信的 text 逐字等于 5 行定制模板（title 留空 → Host 不插空行）');
-ok('端到端：client done 卡 → Host /wechat → ctx.dshIm.send，微信最终文本逐字对齐模板');
+  '最终发到微信的 text 逐字等于 6 行定制模板（title 留空 → Host 不插空行）');
+ok('端到端：client 富格式卡 → Host /wechat → ctx.dshIm.send，微信文本逐字对齐模板');
 
-
-// ── question 卡选项块：从真实 questions[0].options 读编号选项，选项在切换指引后独立成段 ──
+// ── 选项块：question 卡读真实 options，超时到期后发 ──
 setSessions('sA', { sRT: { displayTitle: '实时会话A' } });
 const fOpt = fetchCalls.length;
 pushStatus(new Map([
   ['sA', { running: true }],
   ['sRT', { running: true, pendingInteraction: { kind: 'question', key: 'kOPT', questions: [{ question: '请选择方案', options: [{ label: '选项甲' }, { label: '选项乙' }, { label: '选项丙' }] }] }, completionUnread: false }],
 ]));
-assert.equal(fetchCalls.length, fOpt + 1, '带选项的 question 边沿应发 1 条实时微信');
+assert.equal(fetchCalls.length, fOpt, '选项块 question 边沿也不立即发');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fOpt + 1, '超时到期后发带选项 question 卡');
 const rtOpt = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(rtOpt.title, '', '带选项 question 卡 title 留空');
 const rtOptSegs = rtOpt.desp.split('\n\n');
-assert.equal(rtOptSegs.length, 9, '带选项 question 卡应为 9 段（首行+指引3行+问题+3选项+脚注，无表头）');
+assert.equal(rtOptSegs.length, 9, '带选项 question 卡应为 9 段');
 assert.match(rtOptSegs[0], /^DeepSeek Harness · 会话「实时会话A」【 需要选择 】 \d{2}:\d{2}:\d{2}$/, '首行逐字');
 assert.equal(rtOptSegs[1], '▸ 在微信里发送：', '指引第 2 行');
 assert.equal(rtOptSegs[2], '/session sRT ', '/session 行');
 assert.equal(rtOptSegs[3], '即可切到该会话继续对话。 ', '指引第 4 行');
-assert.equal(rtOptSegs[4], '📌 正文：请选择方案', '正文段开头带醒目标记（在指引之后）');
+assert.equal(rtOptSegs[4], '📌 正文：请选择方案', '正文段');
 assert.equal(rtOptSegs[5], '选项1：选项甲', '选项 1');
 assert.equal(rtOptSegs[6], '选项2：选项乙', '选项 2');
 assert.equal(rtOptSegs[7], '选项3：选项丙', '选项 3');
 assert.equal(rtOptSegs[8], '—— 本条为实时状态提醒，勿在此回复 ——', '统一脚注');
-ok('新增【选项块】：question 卡读真实 options，编号选项在指引后独立成段；无选项时不显示');
+ok('功能融合：选项块 question 卡超时到期后发，读真实 options 编号成段');
+
 console.log(`\n全部通过：${passed} 项断言。`);

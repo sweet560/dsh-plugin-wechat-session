@@ -7,8 +7,9 @@ sessions and links desktop alerts with a WeChat fallback.
 > turn**, it raises a **desktop alert**: exactly ONE **in-app floating card** (does NOT depend on OS
 > notification permission — visible even when you are on another session, click to jump there) plus
 > an alert sound. No OS banner is shown anymore, so there is only one popup. If you neither switch to that
-> session nor clear its pending item within the timeout, it sends a **minimal** WeChat reminder
-> (just "which session is waiting", no walls of text) through the **dsh-im WeChat bot (regular
+> session nor clear its pending item within the timeout, it sends a **richly formatted WeChat card**
+> (task-finished / needs-choice / grants-permission, with the session ID and a `/session` switch
+> command) through the **dsh-im WeChat bot (regular
 > WeChat)**. Two event classes have separate, configurable timeouts: **"needs choice / approval"
 > defaults to 60s**, **"task finished" defaults to 30s**.
 >
@@ -35,16 +36,17 @@ Installing this one package brings both the WeChat Session Bridge plugin and `@x
 - One in-app floating card only (no OS banner): it needs no OS notification permission and shows
   on any session screen, fixing "only the sound plays, no popup" without a second duplicate popup.
 - Per-class timeouts (choice/approval 60s, task-finished 30s by default), each item carrying its
-  own deadline. The overdue WeChat message is **minimal**: a **[waiting on you]** section listing
-  just the session name and event, and a **[finished]** section spelling out "session「X」finished".
-  No question text / numbered options / long setup prose in the message any more.
+  own deadline. On timeout this plugin pushes a **richly formatted WeChat card** per pending item:
+  needs-choice / grants-permission cards carry the session name + session ID + `/session` switch
+  command + the concrete question/body + numbered options; task-finished cards carry the session
+  tag + switch command + a body note. Reuses the battle-tested `summarizeRealtime` template.
 - "Reply directly in WeChat" is powered by **dsh-im native synced questions / remote approvals**,
   NOT by this plugin parsing replies: dsh-im listens to `user-questions/request` / `approval/request`
   and pushes a numbered option card to a WeChat private chat as soon as the question appears.
   One-time setup: enable two-way sync in dsh-im (General → Delivery), then `/sessionlist` and
   `/session <id>` in the chat to bind it to the current session. That card arrives immediately,
-  not after the 60s timeout; this plugin's timeout message is only a minimal fallback — **do not
-  reply under it**. See Chinese README §3.1.
+  not after the 60s timeout; this plugin's timeout card is a formatted status message — **do not
+  reply under it** (use dsh-im's option card to reply). See Chinese README §3.1.
 - Umbrella bundle: one `insert` mounts two loader rows; dsh-im keeps an upgradeable `^5.10.0`
   range and stays on the npm official source.
 
@@ -65,8 +67,8 @@ buttons to verify.
 
 | Part | Source | Role |
 | --- | --- | --- |
-| WeChat Session Bridge (this package) | `lib/index.js` + `lib/client.js` | watches all sessions, one in-app floating card + sound (no OS toasts), per-class timeout batches (60s / 30s), minimal WeChat reminders, card-grouped settings page, click-to-jump |
-| `@xmanrui/dsh-im` | npm official source, `^5.10.0` | regular WeChat bot that delivers the minimal timeout reminder; its native synced questions / remote approvals post answerable numbered option cards and write your reply back to DSH |
+| WeChat Session Bridge (this package) | `lib/index.js` + `lib/client.js` | watches all sessions, one in-app floating card + sound (no OS toasts), per-class timeout batches (60s / 30s), richly formatted WeChat cards on timeout, card-grouped settings page with draft + Save buttons, click-to-jump |
+| `@xmanrui/dsh-im` | npm official source, `^5.10.0` | regular WeChat bot that delivers the formatted timeout cards; its native synced questions / remote approvals post answerable numbered option cards and write your reply back to DSH |
 
 ## Development
 
@@ -81,20 +83,23 @@ CI: `.github/workflows/test.yml` runs the smoke test on push/PR (Node 24, action
 no `NPM_TOKEN` needed. `.github/workflows/sync-gitee.yml` mirrors `main` and tags to Gitee on every
 push (needs the repository secret `GITEE_SSH_PRIVATE_KEY`).
 
-Current version: **1.8.0**.
+Current version: **1.9.0**.
 
-**v1.8.0 highlights (Option 1: multiple DSH sessions ↔ a single WeChat account, realtime)**: ① new
-"Full-session realtime push" switch (**off by default** — behaviour is identical to v1.7.0 when off);
-② when on, any DSH session's question / approval / done edge **immediately** pushes a minimal,
-session-tagged WeChat message (session name + session ID + `/session <sessionId>` switch command)
-to the same chat, without waiting for the 60/30s timeout; ③ send the native dsh-im command
-`/session <sessionId>` in WeChat to switch the chat to that session and keep talking, with dsh-im
-two-way sync ("deliver model answers") pushing the full answers back — **multiple DSH sessions
-serially share one single WeChat account**; ④ delivery path unchanged: `sendWechat()` was split into
-a low-level `postWechat()` (still the only fetch, same Host route / same body contract), reused by
-both realtime push and the "Test realtime push" button; ⑤ no self-built full-answer fetching in the
-client (avoids patching Host subscriptions / internal RPCs that break on upgrade). Smoke tests
-54 → 57 assertions. See `docs/RELEASE_NOTES_v1.8.0.md`.
+**v1.9.0 highlights (feature fusion + settings polish)**: ① the separate "Full-session realtime
+push" switch was removed — the previous "push a minimal message immediately on each status edge"
+behaviour is now folded into timeout delivery; ② when a timeout fires (60s for choice/approval,
+30s for task-finished), `fireBatchTimeout` pushes a **richly formatted WeChat card** per pending
+item (task-finished / needs-choice / grants-permission, with session name + session ID + `/session
+<sessionId>` switch command + the concrete question/body + numbered options), reusing the
+battle-tested `summarizeRealtime` template and its 60s dedupe instead of the old minimal digest;
+③ send the native dsh-im command `/session <sessionId>` in WeChat to switch the chat to that
+session and keep talking, with dsh-im two-way sync ("deliver model answers") pushing the full
+answers back — **multiple DSH sessions serially share one single WeChat account**; ④ the
+"WeChat bot / delivery target" and "Timeout" cards now use **draft + Save buttons** (config is
+written only on Save; the button is idle when unchanged, active when dirty, with hover feedback),
+with tighter card spacing; ⑤ the Save button's three states (idle / dirty / hover) follow the
+`dsh-session-archive` plugin tokens, adapting to light/dark themes. Smoke tests: 63 assertions.
+See `docs/RELEASE_NOTES_v1.9.0.md`.
 
 **v1.7.0 highlights**: ① desktop alerts are now a **single bottom-right in-app floating card**
 (no system notification permission needed, visible even from another session); the OS banner was
