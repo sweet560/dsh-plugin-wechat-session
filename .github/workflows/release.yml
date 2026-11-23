@@ -1,0 +1,75 @@
+name: release
+
+# 推送 v* tag 时自动、幂等地创建 GitHub Release。
+# 背景：此前 publish.yml 只做 npm 可信发布，不建 Release；推 tag 也不会自动建 Release。
+# 于是在发布完成后容易出现「Release 是空的 / 最新没上」，需要人工 gh release create 补救。
+# 本 workflow 补上这一环，让「发布」这件事本身把 Release 也落好。
+#
+# 与其它 workflow 的分工：
+#   * publish.yml    —— 只管 npm 可信发布（含精密的 E409/E403 幂等守卫，不去动它）。
+#   * sync-gitee.yml —— 只管把 main 与 git tag 镜像到 Gitee。
+#   * release.yml（本文件）—— 只管创建 GitHub Release。
+# 建好 Release 会触发 publish.yml 的 release:published，那条 run 本就是幂等跳过，无副作用。
+#
+# 幂等：已存在同名 Release 直接跳过；发布说明取自 docs/RELEASE_NOTES_$TAG.md，
+# 文件缺失时降级用 tag 名做说明，绝不因缺文件让流程红叉。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要创建 Release 的 tag（如 v2.2.2）；留空则取当前 ref 名'
+        required: false
+        type: string
+
+permissions:
+  contents: write # 创建 GitHub Release 必需
+
+# 与其它 workflow 一致：按仓库排队、不取消，避免同一 tag 的多次触发互相打断。
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 幂等创建 GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # 拉全历史与 tag，确保 --verify-tag 可用
+
+      - name: 创建或跳过 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "目标 tag: $TAG"
+
+          NOTES="docs/RELEASE_NOTES_${TAG}.md"
+          TITLE="$TAG"
+          USE_NOTES_FILE=false
+          if [ -f "$NOTES" ]; then
+            FIRST=$(head -n 1 "$NOTES" | sed 's/^# //' | tr -d '\r')
+            [ -n "$FIRST" ] && TITLE="$FIRST"
+            USE_NOTES_FILE=true
+            echo "::notice::发布说明取自 $NOTES，标题=$TITLE"
+          else
+            echo "::warning::$NOTES 不存在，降级用 tag 名作为说明。"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG 已存在，跳过创建（幂等）。"
+            exit 0
+          fi
+
+          if [ "$USE_NOTES_FILE" = "true" ]; then
+            gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES" --verify-tag
+          else
+            gh release create "$TAG" --title "$TITLE" --notes "$TAG" --verify-tag
+          fi
+          echo "::notice::Release $TAG 创建成功。"
