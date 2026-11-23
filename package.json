@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-wechat-session",
-  "version": "2.1.0",
-  "description": "微信通道外设（v2.1.0）：不再依赖 @xmanrui/dsh-im，不接管会话生命周期。三模块——ChannelTransport（纯 iLink 协议适配器，扫码登录 + 长轮询收发）、SessionEventBridge（只读订阅 session/event / agent/assistant-stream，以会话标题行把最终回复镜像到微信、标题读不到退回短码）、ApprovalGate（approval/request / user-questions/request waterfall 应答者）。支持微信 /new 在指定工作目录对应的工作区分组薄创建会话并自动绑定（标题自动加「微信 · 」前缀，缺省「微信 · Clawbot」）、双向自由对话、多会话并行审批与选择题回填（<前缀>=1/0/c、<前缀> 1A 2B）、超时提醒卡、permissionPreset 自动降级、定时未决汇总；绑定与工作目录配置均持久化，重启免重配。零运行时依赖（iLink 协议层为纯 Node 实现）。",
+  "version": "2.2.2",
+  "description": "微信通道外设（v2.2.2）：不再依赖 @xmanrui/dsh-im，不接管会话生命周期。三模块——ChannelTransport（纯 iLink 协议适配器，扫码登录 + 长轮询收发）、SessionEventBridge（只读订阅 session/event / agent/assistant-stream，以会话标题行把最终回复镜像到微信、标题读不到退回短码）、ApprovalGate（approval/request / user-questions/request waterfall 应答者）。支持微信 /new 在指定工作目录对应的工作区分组薄创建会话并自动绑定（标题自动加「微信 · 」前缀，缺省「微信 · Clawbot」）、双向自由对话、多会话并行审批与选择题回填（<前缀>=1/0/c、<前缀> 1A 2B）、超时提醒卡、permissionPreset 自动降级、定时未决汇总；绑定与工作目录配置均持久化，重启免重配。零运行时依赖（iLink 协议层为纯 Node 实现）。",
   "license": "MIT",
   "author": "sweet560 <107355972+sweet560@users.noreply.github.com>",
   "type": "module",
@@ -39,6 +39,9 @@
     "docs/RELEASE_NOTES_v1.9.0.md",
     "docs/RELEASE_NOTES_v2.0.0.md",
     "docs/RELEASE_NOTES_v2.1.0.md",
+    "docs/RELEASE_NOTES_v2.2.0.md",
+    "docs/RELEASE_NOTES_v2.2.1.md",
+    "docs/RELEASE_NOTES_v2.2.2.md",
     "smoke/smoke-test.mjs"
   ],
   "keywords": [

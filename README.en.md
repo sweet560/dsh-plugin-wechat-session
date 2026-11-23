@@ -1,4 +1,4 @@
-# dsh-plugin-wechat-session (WeChat Channel Peripheral · v2.1.0)
+# dsh-plugin-wechat-session (WeChat Channel Peripheral · v2.2.2)
 
 A reminder + WeChat channel plugin for the **DeepSeek Harness desktop app**. **v2.0.0 is a breaking rewrite**: it drops the `@xmanrui/dsh-im` aggregate dependency, talks to WeChat independently over the official iLink protocol, and does not take over session lifecycle — it is purely a **channel adapter + session referrer**. Sessions you explicitly bind with `/use` are persisted (no re-binding after restart). **v2.1.0 adds `/new` thin session creation**: send `/new` in WeChat to create a session in a configured working-folder workspace and bind it immediately (title gets a "微信 · " prefix, defaulting to "微信 · Clawbot").
 

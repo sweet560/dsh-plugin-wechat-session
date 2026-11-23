@@ -25,7 +25,7 @@ function ok(label) { passed += 1; console.log('  ✓ ' + label); }
 // ───────────────────── 1. 清单 / 静态文件 ─────────────────────
 const pkg = await readJson('package.json');
 assert.equal(pkg.name, 'dsh-plugin-wechat-session');
-assert.equal(pkg.version, '2.1.0');
+assert.equal(pkg.version, '2.2.2');
 assert.equal(pkg.type, 'module');
 assert.equal(pkg.main, 'lib/index.js');
 assert.equal(pkg.icon, 'icon.svg');
@@ -89,9 +89,13 @@ for (const loc of ['en', 'zh']) {
 ok('locale/en.json + zh.json（en 为发现基线，描述已改 dsh-im）');
 
 const icon = await readText('icon.svg');
-assert.match(icon, /<svg[\s\S]*width="36"[\s\S]*height="36"/);
-assert.match(icon, /linearGradient/);
-ok('icon.svg 36×36 双色渐变');
+assert.match(icon, /<svg[\s\S]*viewBox="0 0 64 64"[\s\S]*width="64"[\s\S]*height="64"/);
+// m01567：用 dsh-plugin-yanyan-icon 的 buildIconSvg 生成——64×64 自包含静态 SVG。
+assert.match(icon, /#07C160/i, 'icon.svg 应为微信绿底');
+assert.match(icon, /data:image\/png;base64,/, 'logo 应为内嵌的 PNG 位图');
+assert.match(icon, /<image[\s\S]*xlink:href=[\s\S]*data:image\/png;base64,/, '应为内嵌位图的 image 元素');
+assert.ok(!/<script|foreignObject|currentColor/i.test(icon), '图标不应含脚本/外链/动态色');
+ok('icon.svg 64×64 微信官方图标（工具生成，微信绿底 + 内嵌双气泡位图）');
 
 // 代码里彻底不再有 Server 酱调用痕迹（配置键 / URL / 出库 fetch）
 for (const f of ['lib/index.js', 'lib/client.js']) {
@@ -105,7 +109,7 @@ ok('代码彻底移除 Server 酱 / sctapi / sendKey（改走 iLink）');
 // ───────────────────── 2. Host half（v2.1.0 通道外设版）─────────────────────
 const host = await import(new URL('../lib/index.js', import.meta.url).href);
 assert.equal(host.name, 'dsh-plugin-wechat-session');
-assert.equal(host.VERSION, '2.1.0', '版本须为 2.1.0');
+assert.equal(host.VERSION, '2.2.2', '版本须为 2.2.2');
 assert.deepEqual(host.inject, ['webServer', 'connection']);
 assert.equal(typeof host.apply, 'function');
 for (const r of ['WECHAT_ROUTE','HEALTH_ROUTE','LOGIN_ROUTE','LOGIN_STATUS_ROUTE','INBOUND_ROUTE','SESSIONS_ROUTE','QR_IMAGE_ROUTE','SETTINGS_ROUTE']) {
@@ -439,6 +443,153 @@ ok('ApprovalRegistry：延迟提醒上限 + 耗尽后自动降级');
   ok('选择题：任意会话（含未绑定）回填 + 字母→label + 多选 + intent 跳过');
 }
 
+// m01709：微信回填胜出后调官方 userQuestions.answer() 让投影 settle 原生卡（替代非官方 dismiss 轮询）。
+{
+  const sent = [];
+  const answerCalls = [];
+  const qb = createBridge({
+    config: { prefixLength: 6, questionTimeoutMs: 0 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    answerUserQuestion: async (agent, callId, answer) => { answerCalls.push({ agent, callId, answer }); return true; },
+  });
+  const agent = { session: { id: 'session-3f2a11-db79-4ec0' } }; // 前缀 3f2a11
+  const questions = [{ id: 'q1', question: '方向?', options: [{ label: '甲' }, { label: '乙' }] }];
+  const answerPromise = qb.onUserQuestions({ agent, questions, wait: { callId: 'call-settled-1' } });
+  const r = await qb.handleInbound('3f2a11 1B');
+  assert.equal(r.ok, true, '回填应结算成功');
+  await answerPromise;
+  await new Promise((r2) => setTimeout(r2, 0)); // 等官方 answer 的异步调用跑完
+  assert.equal(answerCalls.length, 1, '回填胜出后应调一次官方 answer');
+  assert.equal(answerCalls[0].callId, 'call-settled-1', '应传正确的 callId');
+  assert.equal(answerCalls[0].agent, agent, '应传正确的 agent');
+  assert.deepEqual(answerCalls[0].answer.answers[0].selected, ['乙'], '应传正确答案（1B→乙）');
+  qb.dispose();
+  ok('m01709：微信回填胜出后调官方 userQuestions.answer() settle 原生卡');
+}
+
+// m02017：选择题定期提醒——每 60s（测试用 20ms）发一条带选项+回填码的提醒，最多 3 次，
+// 到顶只停提醒不自动跳过；微信回填结算后立即停提醒。
+{
+  const sent = [];
+  const qb = createBridge({
+    config: { prefixLength: 6, questionRemindIntervalMs: 20, questionMaxReminders: 3, questionTimeoutMs: 0 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    answerUserQuestion: async () => true,
+  });
+  const agent = { session: { id: 'session-3f2a11-db79-4ec0' } }; // 前缀 3f2a11
+  const questions = [{ id: 'q1', question: '方向?', options: [{ label: '甲' }, { label: '乙' }] }];
+  // 不传 next → 独占，无原生 UI 竞答干扰；题保持未结算。
+  qb.onUserQuestions({ agent, questions, wait: { callId: 'call-remind-1' } });
+  await new Promise((r) => setTimeout(r, 150)); // 20ms × 3 次提醒全部发完并停止
+  const reminds = sent.filter((t) => t.includes('[提醒]') && t.includes('选择题仍待选择'));
+  assert.equal(reminds.length, 3, '最多发 3 次提醒，到顶停止（不自动跳过）');
+  assert.ok(reminds[0].includes('A.甲') && reminds[0].includes('B.乙'), '提醒应带选项');
+  assert.ok(reminds[0].includes('3f2a11 1A'), '提醒应带回填码前缀');
+  qb.dispose();
+  ok('m02017：选择题每 1 分钟提醒一次（带选项+回填码）、最多 3 次、到顶不自动跳过');
+}
+// m02017：微信回填结算后立即停提醒（已作答不再提醒）。
+{
+  const sent = [];
+  const qb = createBridge({
+    config: { prefixLength: 6, questionRemindIntervalMs: 20, questionMaxReminders: 3, questionTimeoutMs: 0 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    answerUserQuestion: async () => true,
+  });
+  const agent = { session: { id: 'session-3f2a11-db79-4ec0' } };
+  const questions = [{ id: 'q1', question: '方向?', options: [{ label: '甲' }, { label: '乙' }] }];
+  qb.onUserQuestions({ agent, questions, wait: { callId: 'call-remind-2' } });
+  const r = await qb.handleInbound('3f2a11 1A'); // 立即回填结算
+  assert.equal(r.ok, true, '回填应成功');
+  sent.length = 0;
+  await new Promise((r2) => setTimeout(r2, 80)); // 等超过 3 个提醒周期
+  const remindsAfter = sent.filter((t) => t.includes('[提醒]'));
+  assert.equal(remindsAfter.length, 0, '结算后不应再发提醒');
+  qb.dispose();
+  ok('m02017：微信回填结算后立即停提醒，不再骚扰用户');
+}
+
+// m00006 回归：形似回填码但无待决池/无匹配会话时，绝不误投 activeSession。
+// 用户核心抱怨：微信回「前缀 1A」被当成聊天投给最近 /use 绑定的会话。
+{
+  const sent = [];
+  const prompts = [];
+  const gb = createBridge({
+    config: { prefixLength: 6 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    submitPrompt: async (sid, text) => { prompts.push({ sid, text }); return { accepted: true }; },
+    // 模拟宿主按前缀反查全会话：589a9e 无匹配（正是用户截图里那张卡的会话）
+    resolveSessionByPrefix: async (prefix) => ({ ok: false, error: '未找到匹配前缀' }),
+  });
+  await gb.handleInbound('/use session-ea2e2ba9-9ec0-4795-979d-38c424502c17'); // 绑定一个无关会话
+  sent.length = 0;
+  // 微信回填码但无待决题：必须明确提示「未当作聊天转交」，且 submitPrompt 零调用
+  const r = await gb.handleInbound('589a9e 1A');
+  assert.equal(r.action, 'question-reply-stale', '无待决题的回填码应走 stale 分支而非 prompt');
+  assert.equal(prompts.length, 0, '回填码绝不能误投给已绑定会话（m00006 核心）');
+  assert.ok(sent.some((t) => t.includes('没有待决选择题') && t.includes('未当作聊天转交')), '应明确提示未转交');
+  gb.dispose();
+  ok('回归【m00006】：回填码无待决池时明确提示、绝不误投 activeSession');
+}
+
+// m00006 根治：waterfall 链式 next 下，native UI 应答器 pending 不调 next 会饿死
+// 排在链尾的监听器。本插件必须 prepend 抢占链首，回调才会执行、待决题才会注册。
+{
+  const idxSrc = await readText('lib/index.js');
+  assert.match(idxSrc, /ctx\.on\('user-questions\/request',[\s\S]{0,120}?bridge\.onUserQuestions\(request, next\),\s*true\)/,
+    'user-questions 应答者必须 prepend（第三参 true）抢占 waterfall 链首，避免被 native UI pending 饿死');
+  assert.match(idxSrc, /ctx\.on\('approval\/request',[\s\S]{0,120}?bridge\.onApprovalRequest\(request, next\),\s*true\)/,
+    'approval 应答者同样应 prepend，避免同类饿死');
+  ok('回归【m00006·根治】：两个 waterfall 应答者均 prepend 抢占链首');
+}
+
+// m00006 行为级：未绑定会话发起选择题，native UI 应答器（next）永远 pending，
+// 微信回填仍必须结算成功且 answer 胜出（prepend + race 语义）。
+{
+  const sent = [];
+  const qb2 = createBridge({ config: { prefixLength: 6, questionTimeoutMs: 0 }, send: async (t) => { sent.push(t); }, log: () => {} });
+  const agent = { session: { id: 'session-589a9e11-2222-3333-4444-555566667777' } }; // 前缀 589a9e
+  const questions = [{ id: 'q1', question: '如何处理？', options: [{ label: '选项甲' }, { label: '选项乙' }] }];
+  // next() 返回一个永远 pending 的 Promise，模拟原生 UI 弹卡等点击（不调 next 下游、不 resolve）。
+  const answerPromise = qb2.onUserQuestions({ agent, questions, wait: { callId: 'cq-race' } }, () => new Promise(() => {}));
+  const r = await qb2.handleInbound('589a9e 1B');
+  assert.equal(r.action, 'question-reply', '回填码应命中选择题分支');
+  assert.equal(r.ok, true, 'native UI pending 时微信回填仍应结算');
+  const answer = await Promise.race([answerPromise, new Promise((_, rej) => setTimeout(() => rej(new Error('回填未胜出')), 500))]);
+  assert.deepEqual(answer.answers, [{ id: 'q1', selected: ['选项乙'] }], '微信回填应胜出并返回 1B=选项乙');
+  qb2.dispose();
+  ok('回归【m00006·竞答】：native UI pending 时未绑定会话微信回填仍胜出');
+}
+
+// m00497 回归：未绑定会话的插件超时绝不能用空答案抢先 settle（否则 Promise.race
+// 判微信胜出→变成「已跳过」，用户随后在 DSH 界面手选没人接收=「手动选择无反应」）。
+// 超时只发提示+清待决池，让微信回填失效，最终答案交给原生 UI 的 next() 手选。
+{
+  const sent = [];
+  const qb3 = createBridge({ config: { prefixLength: 6, questionTimeoutMs: 30 }, send: async (t) => { sent.push(t); }, log: () => {} });
+  const agent = { session: { id: 'session-97time-1111-2222-3333-444455556666' } };
+  const questions = [{ id: 'q1', question: '如何安排？', options: [{ label: '加按钮' }, { label: '先不改' }] }];
+  let resolveUi;
+  const uiPromise = new Promise((res) => { resolveUi = res; });
+  const answerPromise = qb3.onUserQuestions({ agent, questions, wait: { callId: 'cq-timeout' } }, () => uiPromise);
+  await new Promise((r) => setTimeout(r, 90)); // 等插件 30ms 超时触发
+  assert.ok(sent.some((t) => t.includes('选择题已超时')), '超时提示仍应发出');
+  let earlySettled = false;
+  answerPromise.then(() => { earlySettled = true; });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(earlySettled, false, '超时后 answerPromise 不得被空答案结算（否则 DSH 手选失效=已跳过）');
+  // 用户在 DSH 界面手选，原生 UI 的 next() resolve
+  resolveUi({ answers: [{ id: 'q1', selected: ['加按钮'] }] });
+  const finalAnswer = await Promise.race([answerPromise, new Promise((_, rej) => setTimeout(() => rej(new Error('手选未胜出')), 500))]);
+  assert.deepEqual(finalAnswer.answers, [{ id: 'q1', selected: ['加按钮'] }], '超时后 DSH 手选仍应胜出');
+  qb3.dispose();
+  ok('回归【m00497】：未绑定会话超时不抢答、DSH 手选仍生效');
+}
+
 // 出站流式聚合：agent/assistant-stream 的 text-delta 聚合后在 end 一次性投递微信
 {
   const sent = [];
@@ -497,6 +648,34 @@ ok('ApprovalRegistry：延迟提醒上限 + 耗尽后自动降级');
   ok('出站流式：仅 committed/assistant/message 投递 + 中间播报/放弃/无 outcome 跳过 + session/event assistant/* 跳过 + 未绑定忽略');
 }
 
+// m00564：正文镜像打点与「正文已镜像则吞掉重复 done 卡」的判定依据
+{
+  const sent = [];
+  const dsup = createBridge({
+    config: { prefixLength: 6, doneSuppressWindowMs: 60 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+  });
+  const sidA = 'session-body-mirror-a';
+  const sidB = 'session-body-mirror-b';
+  // 尚未发正文：两个会话都不应被抑制
+  assert.equal(dsup.didRecentlySendBody(sidA), false, '未发过正文的会话不应抑制 done 卡');
+  assert.equal(dsup.didRecentlySendBody(sidB), false, '未发过正文的另一会话也不应抑制');
+  await dsup.handleInbound('/use ' + sidA);
+  // sidA 发一条 committed/assistant/message 正文
+  dsup.onAssistantStream({ agent: { session: { id: sidA } }, frame: { type: 'start', attemptId: 'z1', revision: 0 } });
+  dsup.onAssistantStream({ agent: { session: { id: sidA } }, frame: { type: 'chunk', attemptId: 'z1', revision: 1, chunk: { type: 'text-delta', text: '任务正文已发' } } });
+  dsup.onAssistantStream({ agent: { session: { id: sidA } }, frame: { type: 'end', attemptId: 'z1', revision: 2, outcome: { kind: 'committed', eventType: 'assistant/message' } } });
+  assert.equal(dsup.didRecentlySendBody(sidA), true, '刚镜像过正文的会话应抑制其 done 卡（避免重复提醒）');
+  assert.equal(dsup.didRecentlySendBody(sidB), false, '正文打点按 sid 隔离，不误伤其它会话');
+  assert.equal(dsup.didRecentlySendBody(''), false, '空 sid 不应抑制');
+  // 窗口过期后不再抑制
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(dsup.didRecentlySendBody(sidA), false, '超出 doneSuppressWindowMs 后不再抑制');
+  dsup.dispose();
+  ok('m00564：正文镜像打点抑制重复 done 卡（按 sid 隔离、窗口过期失效）');
+}
+
 // ── 2B. Host apply：7 路由 + 官方 seam + 准入裁决 ──
 const STATE_MAIN = '__dsh_ws_main_state__.json';
 const STATE_IDLE = '__dsh_ws_idle_state__.json';   // 故意不存在 → 未登录
@@ -543,13 +722,13 @@ function makeHostCtx(config = {}, opts = {}) {
 }
 const hc = makeHostCtx();
 const hcIdle = makeHostCtx({}, { stateFile: STATE_IDLE }); // 故意未登录，用于 502/idle 断言
-assert.equal(hc.registered.length, 8, '应注册 8 条 exact 路由（含 SETTINGS_ROUTE）');
+assert.equal(hc.registered.length, 9, '应注册 9 条 exact 路由（含 SETTINGS_ROUTE + NOTIFY_CLOCK_ROUTE）');
 assert.ok(hc.registered.every((r) => r.kind === 'exact' && typeof r.handler === 'function'));
 assert.equal(typeof hc.events['session/event'], 'function', '应订阅 session/event');
 assert.equal(typeof hc.events['agent/assistant-stream'], 'function', '应订阅 agent/assistant-stream（dsh 0.1.5 起 live 正文走这里）');
 assert.equal(typeof hc.events['approval/request'], 'function', '应订阅 approval/request');
 assert.equal(typeof hc.events['user-questions/request'], 'function', '应订阅 user-questions/request（选择题）');
-ok('apply：8 条 exact 路由 + session/event + agent/assistant-stream + approval/request + user-questions/request 官方 seam');
+ok('apply：9 条 exact 路由 + session/event + agent/assistant-stream + approval/request + user-questions/request 官方 seam');
 
 const route = (p) => hc.registered.find((r) => r.path === p);
 
@@ -594,7 +773,7 @@ res = await invoke(route(host.HEALTH_ROUTE).handler, makeReq('GET', null));
 assert.equal(res.code, 200);
 const health = JSON.parse(res.body);
 assert.equal(health.name, 'dsh-plugin-wechat-session');
-assert.equal(health.version, '2.1.0');
+assert.equal(health.version, '2.2.2');
 assert.equal(health.wechatReady, true, 'STATE_MAIN 有 token，wechatReady 应为 true');
 assert.equal(typeof health.boundSessions, 'number');
 assert.equal(health.loginStatus, 'ready');
@@ -911,7 +1090,8 @@ const docListeners = {};          // document 事件回调：type -> [fn]
 const appendedElements = [];      // m05207：唯一的「弹窗」= 应用内浮层卡片
 const createdNotifications = appendedElements; // 兼容旧断言名：弹窗计数即浮层数量
 const osNotifications = [];       // new Notification 实例（本轮起应为 0）
-const fetchCalls = [];            // 所有 sendWechat 的 fetch
+const fetchCalls = [];            // 所有 sendWechat 的 fetch（不含宿主计时预约）
+const notifyClockCalls = [];      // m00713：宿主计时预约/取消请求（独立计数，不干扰 fetchCalls 断言）
 const batchTimeouts = [];         // root.setTimeout 的调用（30 秒批次计时）
 const clearedTimeouts = [];       // root.clearTimeout 的调用（取消批次）
 const miscTimeouts = [];          // 裸 setTimeout（toast 自动关闭等）
@@ -977,7 +1157,11 @@ const sandbox = {
   self: fakeWindow,
   document: fakeDocument,
   Notification: FakeNotification,
-  fetch: async (url, opts) => { fetchCalls.push({ url, opts }); return { json: async () => ({ ok: true }) }; },
+  fetch: async (url, opts) => {
+    // m00713：宿主计时预约/取消请求独立计数，不干扰 60+ 处 fetchCalls（/wechat）断言。
+    if (String(url).includes('/notify-clock')) { notifyClockCalls.push({ url, opts }); return { json: async () => ({ ok: true }) }; }
+    fetchCalls.push({ url, opts }); return { json: async () => ({ ok: true }) };
+  },
   console: fakeWindow.console,
   Symbol, Object, JSON, Date, Math, Number, String, Array, Promise, URLSearchParams, Buffer,
   setTimeout: controlledSetTimeout, clearTimeout() {}, setInterval: () => ++timerSeq, clearInterval() {},
@@ -2089,6 +2273,59 @@ assert.equal(mqSegs[10], 'B 不发', '第 2 题选项 B');
 assert.ok(mqSegs[11].includes('需要选择') && mqSegs[11].includes('smq 1A 2B'), '多问题卡脚注应带实际前缀 + 数字字母回填码');
 ok('多问题修复：2 题卡逐题输出正文+选项，单题输出保持原样');
 
+
+// ── 宿主计时根治（m00713）：Node 定时器准点发卡 + 取消 + 跨通道去重 ──
+{
+  const clockSent = [];
+  const clockFetch = async (url, init) => {
+    const u = String(url);
+    let body = { ret: 0 };
+    if (u.includes('getupdates')) body = { ret: -14, errcode: -14 }; // 不挂起长轮询
+    else if (u.includes('getconfig')) body = { typing_ticket: 'TICKET_CLOCK' };
+    else if (u.includes('sendmessage')) {
+      try {
+        const payload = JSON.parse(init.body);
+        clockSent.push(payload?.msg?.item_list?.[0]?.text_item?.text || '');
+      } catch { /* ignore */ }
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  };
+  const hcClock = makeHostCtx({}, { fetchImpl: clockFetch });
+  const nc = hcClock.registered.find((r) => r.path === host.NOTIFY_CLOCK_ROUTE);
+  assert.ok(nc && typeof nc.handler === 'function', '应注册 notify-clock 宿主计时路由');
+  const postClock = (obj) => invoke(nc.handler, makeReq('POST', JSON.stringify(obj)));
+
+  // 非 POST → 405；无 dedupeKey → 400
+  assert.equal((await invoke(nc.handler, makeReq('GET', null))).code, 405, 'notify-clock 拒绝非 POST');
+  assert.equal((await postClock({ title: 'x' })).code, 400, 'notify-clock 缺 dedupeKey → 400');
+
+  // 预约 20ms 后发卡，Node 定时器不受浏览器节流 → 90ms 内必准点发出
+  const res1 = await postClock({ dedupeKey: 'clock-A', title: '宿主计时', desp: '准点发卡', deadline: Date.now() + 20, kind: 'question', sid: 'sClockA' });
+  assert.equal(res1.code, 200);
+  assert.equal(JSON.parse(res1.body).scheduled, true, '预约应返回 scheduled:true');
+  await new Promise((r) => setTimeout(r, 90));
+  assert.equal(clockSent.length, 1, '宿主 Node 定时器准点发出 1 条卡');
+  assert.match(clockSent[0], /宿主计时/, '发的卡内容应是预约时的 title');
+
+  // 取消预约：schedule 后立刻 cancel，等待后不应发
+  const res2 = await postClock({ dedupeKey: 'clock-B', title: '会被取消', deadline: Date.now() + 20, kind: 'question', sid: 'sClockB' });
+  assert.equal(JSON.parse(res2.body).scheduled, true);
+  const resCancel = await postClock({ dedupeKey: 'clock-B', action: 'cancel' });
+  assert.equal(JSON.parse(resCancel.body).cancelled, true, '取消应返回 cancelled:true');
+  await new Promise((r) => setTimeout(r, 90));
+  assert.equal(clockSent.length, 1, '取消预约后不应再发卡');
+  ok('宿主计时根治（m00713）：Node 定时器准点发卡 + 取消预约不误发');
+
+  // 跨通道去重：宿主计时器已 claim 'clock-A'，wechat 带同 key 再来应被吞
+  const wr = hcClock.registered.find((r) => r.path === host.WECHAT_ROUTE);
+  const wres = await invoke(wr.handler, makeReq('POST', JSON.stringify({
+    title: '重复卡', desp: '同 dedupeKey', dedupeKey: 'clock-A', kind: 'question', sid: 'sClockA',
+  })));
+  assert.equal(wres.code, 200);
+  assert.equal(JSON.parse(wres.body).suppressed, 'duplicate', '同 dedupeKey 后到应被去重吞掉');
+  assert.equal(clockSent.length, 1, '去重后不应再发第 2 条');
+  ok('宿主计时根治（m00713）：宿主计时器与 wechat 共用 dedupeKey，先到 claim 后到吞掉');
+}
 
 // ── 清理：停掉所有 host 长轮询 + 删除 smoke 临时状态文件 ──
 for (const hc of allHostCtxs) hc.dispose();

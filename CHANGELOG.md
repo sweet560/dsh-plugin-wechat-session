@@ -3,6 +3,35 @@
 本文件记录 dsh-plugin-wechat-session（微信会话互通）的版本更迭。
 全部条目用中文书写。
 
+## v2.2.2（2026-11-23）— 选择题定期提醒（用户指定 patch 递增）
+
+本轮为小功能版本，新增「选择题定期提醒」机制：用户与微信端均未操作时，每隔一段时间在微信再次推送一条带选项与回填码的提醒，避免选择题迟迟未操作却只等来超时提示。插件仍不接管会话生命周期。
+
+- **新增【选择题定期提醒】**：复用审批（ApprovalRegistry）已有的提醒机制范式。选择题此前只有 5 分钟硬超时、无任何提醒；现新增 `questionRemindIntervalMs`（默认 60s，回落 `remindIntervalMs`）与 `questionMaxReminders`（默认 3，回落 `maxReminders`）。每到期推一条 `[提醒] 选择题仍待选择` 文本，含问题、编号选项与回填码（单题 `前缀 1A`、多题 `前缀 1A 2B`）。到顶只停提醒、不自动跳过，5 分钟硬超时才关闭回填；任一端（微信回填 / DSH 手选）作答立即通过 `clearQuestionReminder` 停提醒。在 `finish` / 超时 / UI 胜出 / dispose 四处均清理定时器，杜绝泄漏。
+- **全量文案同步**：README.md / README.en.md / 设置页 i18n（locale zh/en）/ package.json description / lib/index.js VERSION / client 关于页版本号均更新为 v2.2.2。
+- **验证**：`node --check` 五模块通过；`node smoke/smoke-test.mjs` → **99 项断言全部通过**（新增 2 条 m02017 断言：提醒准点发 3 次且含选项/回填码、回填后停提醒；历史 m00006/m00497/m00564/m00713/m01072/m01709 修复全绿，路由数 9 条）。
+
+## v2.2.1（2026-11-23）— 撤卡改用官方 answer()，去除非官方 API 依赖（用户指定 patch 递增）
+
+本轮为小修复版本，把「微信回填后撤掉 DSH 原生选择卡」的实现从非官方 `PendingQuestion.dismiss()` 轮询彻底改为官方 `userQuestions.answer()`，去掉了对非官方 API 的依赖。插件仍不接管会话生命周期。
+
+- **架构级【撤卡改用官方 answer()】**：核实卡残留真正根因是时序错配——窗口内回填（state=open）由 tool/result 自动 settle，卡本就消失；超时后晚到（state=continued）插件只 resolve 内部 decision，未走会产生 settle 事件的通道，投影停在 continued 导致卡残留。官方 `userQuestions.answer()` 正是为 pending 晚到设计：steer 一条 `source.kind='user-question-reply'` 消息命中投影 `user/message` 分支（不查 state、按 callId settle）。修复：host 回填胜出时按 callId/agent/答案调官方 `ctx.get('userQuestions').answer()`（try/catch、失败不影响回填；open 态返回 false 由 tool/result 自动 settle，两态互斥不重复结算）。
+- **清理非官方机制**：删除 client 每 2 秒的 dismiss 轮询（`dismissedSettled`/`settledPollRequest`/`dismissSettledCards`/`settledTimer`）、host settled 队列（`settledQuestions`/`SETTLED_WINDOW_MS`/`getSettledQuestionIds`）、`/settled` 路由（`SETTLED_ROUTE`/`settledHandler`）。不再依赖任何非官方 `PendingQuestion.dismiss()`。
+- **全量文案同步**：README.md / README.en.md / 设置页 i18n（locale zh/en）/ package.json description / lib/index.js VERSION / client 关于页版本号均更新为 v2.2.1。
+- **验证**：`node smoke/smoke-test.mjs` → **97 项断言全部通过**（新增「回填胜出后调官方 answer()」回归，含 callId/agent/答案精确断言；此前 m00006/m00497/m00564/m00713/m01072 修复全绿，路由数 9 条）。
+
+## v2.2.0（2026-11-23）— 回填/计时根治 + 原生卡残留清理（用户指定 minor 递增）
+
+本轮为纯修复版本，聚焦真机验证中暴露的回填误投、通知延迟、卡片残留等问题，其中通知计时改为宿主 Node 定时器属架构级调整。插件仍不接管会话生命周期。
+
+- **修复【微信回填码误投到已绑定会话】**：根因是 DSH `ctx.waterfall` 为链式 `next()`，原生 UI 应答器（`dsh-client-ui-user-questions`）pending 等点击且不调 `next()`，本插件 listener 默认排在链尾导致回调永不执行、待决池为空，回填码掉进自由对话误投 activeSession。修复：waterfall 应答者注册加 `prepend:true` 抢占链首；新增 `looksLikeQuestionReply()` 防御底座——形似 `<前缀> <数字+字母>` 的文本绝不投给 activeSession，而是按前缀反查全会话（`resolveSessionByPrefix`）结算或明确提示"无待决选择题"。
+- **修复【未绑定会话 DSH 手动选择无反应】**：prepend 后硬超时曾以空答案 `finish()` 抢先 settle Promise.race，导致用户随后在 DSH 界面手选无人接收。修复：未绑定会话（有原生 UI 经 `next()` 兜底）超时只让微信回填失效、交回手选；绑定会话无兜底仍 fail-closed 回空答案。
+- **修复【正文已到仍发重复完成卡】**：正文镜像（host 半边 `onAssistantStream`）与完成卡（client 半边 uiSession 边沿）是两条独立通道，各发一条。修复：host 发正文按 sid 打时间戳，client 发卡带 kind+sid，`/wechat` 出站口统一拦截——done 卡若对应会话近期（默认 300s）发过正文就吞掉；未绑定会话无正文镜像仍保留完成提醒。
+- **架构级【宿主计时根治微信通知延迟】**：原批次计时用浏览器渲染进程 `setTimeout`（后台被 Chromium 节流到分钟级），窗口获焦点才补发。修复：新增 `/notify-clock` 路由 + 宿主 Node 定时器，client 在事件边沿把"卡片内容+截止时间+dedupeKey"预约给宿主准点发卡，已响应时事件驱动取消；宿主与 `/wechat` 共用 `deliverCard()` 与 60s dedupeKey 去重杜绝双发。client 本地批次逻辑保留（兼容既有断言），桌面通知仍即时弹。
+- **修复【微信回填生效但 DSH 原生选择卡残留】**：本插件 prepend 胜出后，原生 UI 应答器的 callId 卡仍 pending 等点击不消失。核实 DSH 无公开撤卡 API、host→client 无实时推送，唯一入口是非官方 `PendingQuestion.dismiss()`（callId 卡走 hide 分支）。修复：host 在 `resolveQuestions` 胜出时按 callId 记录 settled（5 分钟窗），新增 `/settled` 路由，client 每 2 秒轮询已结算 callId 并对命中的残留卡调 `dismiss()`（软判 + try/catch + 按 callId 精确匹配 + 幂等）。需真机确认 hide 撤卡干净。
+- **全量文案同步**：README.md / README.en.md / 设置页 i18n（locale zh/en）/ package.json description / lib/index.js VERSION / client 关于页版本号均更新为 v2.2.0。
+- **验证**：`node --check` 五模块通过；`node smoke/smoke-test.mjs` → **99 项断言全部通过**（新增 settled callId 记录、client dismiss 精确匹配幂等、/settled 路由、宿主计时准点/取消/去重等回归；历史 m00006/m00497/m00564/m00713 全绿）。`npm pack` 26 文件通过，tar 核验含全部修复标记。
+
 ## v2.1.0（2026-11-20）— /new 薄创建会话 + 工作目录可配
 
 在 v2.0.0「通道外设」基础上新增会话薄创建能力（用户明确指定 minor 版本）。插件仍不接管会话生命周期：`/new` 只调一次 DSH 官方 create + rename 拿 sessionId 立即当绑定目标，不维护会话池、不自动清理、不做映射表。

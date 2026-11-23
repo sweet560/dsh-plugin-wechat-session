@@ -1,4 +1,4 @@
-# dsh-plugin-wechat-session 通道外设版（v2.1.0）的 profile 挂载层。
+# dsh-plugin-wechat-session 通道外设版（v2.2.2）的 profile 挂载层。
 #
 # 一个包只挂一条 loader 行——本插件自己。v2.0.0 起不再是聚合包：
 #   - 不再挂载 dsh-im 微信机器人包，顶层 dependencies 也已移除。
