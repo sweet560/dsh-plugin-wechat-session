@@ -2,14 +2,19 @@
 // 运行：npm test
 //
 // 覆盖：
-//   1. 清单契约（package.json / cordis.patch.yml / locale / icon）
-//   2. Host half：路由注册、准入裁决、dsh-im 主动投递（ctx.dshIm.send）、错误分支
-//   3. Client half：模块包装导出、配置读写、设置页与 watchers 能无异常挂载、四类回归
+//   1. 清单契约（package.json / cordis.patch.yml / locale / icon）—— v2.1.0 单插件、无 dsh-im
+//   2. lib/host/bridge.js：会话前缀寻址、待决池幂等结算、permissionPreset 降级、延迟提醒上限
+//   3. Host half：8 条路由注册、准入裁决、iLink 投递、扫码登录、/new 薄创建、seam 订阅
+//   4. Client half：模块包装导出、配置读写、设置页与 watchers 能无异常挂载、历史回归
 
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, unlink } from 'node:fs/promises';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
+import { sessionPrefix, parseInbound, ApprovalRegistry, createBridge, humanizeError } from '../lib/host/bridge.js';
+import { createBindingStore } from '../lib/host/binding-store.js';
+import { createSettingsStore } from '../lib/host/settings-store.js';
+import { createTransport } from '../lib/channel/transport.js';
 
 const root = new URL('../', import.meta.url);
 const readText = (p) => readFile(new URL(p, root), 'utf8');
@@ -20,7 +25,7 @@ function ok(label) { passed += 1; console.log('  ✓ ' + label); }
 // ───────────────────── 1. 清单 / 静态文件 ─────────────────────
 const pkg = await readJson('package.json');
 assert.equal(pkg.name, 'dsh-plugin-wechat-session');
-assert.equal(pkg.version, '1.9.0');
+assert.equal(pkg.version, '2.1.0');
 assert.equal(pkg.type, 'module');
 assert.equal(pkg.main, 'lib/index.js');
 assert.equal(pkg.icon, 'icon.svg');
@@ -30,12 +35,18 @@ assert.equal(pkg.dsh.client.platform, 'web');
 assert.ok(Array.isArray(pkg.dsh.client.inject) && pkg.dsh.client.inject.length >= 1);
 assert.equal(pkg.exports['.'], './lib/index.js');
 assert.equal(pkg.exports['./client'], './lib/client.js');
-ok('package.json 基本字段与 dsh 声明（v1.9.0 功能融合：超时发富格式卡 + /session 串行切换）');
+ok('package.json 基本字段与 dsh 声明（v2.1.0 通道外设版：/new 薄创建 + 多会话并行审批）');
 
-// 聚合包：声明可升级范围的 dsh-im 直接依赖，装伞包自动带上微信机器人
-assert.ok(pkg.dependencies?.['@xmanrui/dsh-im'], '缺少 @xmanrui/dsh-im 依赖');
-assert.match(pkg.dependencies['@xmanrui/dsh-im'], /\^|>=|~|\*/, 'dsh-im 必须是可升级版本范围，不能锁死精确版本');
-ok('聚合包声明可升级的 dsh-im 依赖（保证随时能拉最新版）');
+// v2.0.0：彻底去除 dsh-im 聚合依赖，单插件独立运行（纯 iLink + 官方 seam）
+assert.equal(pkg.dependencies?.['@xmanrui/dsh-im'], undefined, 'v2.0.0 不应再依赖 @xmanrui/dsh-im');
+assert.ok(!pkg.dependencies || Object.keys(pkg.dependencies).length === 0, '不应有任何运行时依赖（纯 iLink 零依赖）');
+assert.ok(pkg.files?.includes('lib/channel/ilink.mjs'), 'files 应含 iLink 协议层');
+assert.ok(pkg.files?.includes('lib/channel/transport.js'), 'files 应含通道适配器');
+assert.ok(pkg.files?.includes('lib/host/bridge.js'), 'files 应含宿主事件/审批桥');
+assert.ok(pkg.files?.includes('lib/host/binding-store.js'), 'files 应含绑定状态持久化模块');
+assert.ok(pkg.files?.includes('lib/host/settings-store.js'), 'files 应含设置持久化模块（/new 工作目录）');
+assert.ok(pkg.files?.includes('vendor/qrcode.cjs'), 'files 应含内置二维码库（内嵌扫码，零 npm 依赖）');
+ok('去 dsh-im：无运行时依赖，files 含三模块 + 两个持久化 store + 内置二维码库');
 
 // 宿主兼容：不声明 engines.dsh（否则宿主只按它判定，跨 RC 会整行禁用）
 assert.equal(pkg.engines.dsh, undefined, '不要声明 engines.dsh');
@@ -55,18 +66,19 @@ const patch = await readText('cordis.patch.yml');
 assert.match(patch, /- insert:/);
 assert.match(patch, /id: dsh-plugin-wechat-session/);
 assert.match(patch, /name: 'dsh-plugin-wechat-session'/);
-assert.match(patch, /botId: ''/);
-assert.match(patch, /targetId: ''/);
+assert.match(patch, /prefixLength: 6/, 'patch 应含 prefixLength 配置');
+assert.match(patch, /approvalTimeoutMs: 300000/, 'patch 应含回填窗口配置（5 分钟）');
+assert.ok(!/botId:/.test(patch), 'patch 不应再有 botId（改扫码登录）');
+assert.ok(!/targetId:/.test(patch), 'patch 不应再有 targetId（改扫码登录）');
 assert.ok(!/sendKey/.test(patch), 'patch 不应再有 sendKey');
-ok('cordis.patch.yml 挂载行 + botId/targetId 服务端兜底');
+ok('cordis.patch.yml 单条挂载行 + prefixLength/approvalTimeoutMs（去 botId/targetId，改扫码）');
 
-// 聚合包：一次 insert 挂两条 entry，第二条把 dsh-im 也挂上且带防重守卫
+// v2.0.0：单插件，不再挂 dsh-im 第二条 entry
 const entryNameMatches = patch.match(/^\s*- id:/gm) || [];
-assert.equal(entryNameMatches.length, 2, 'patch 应恰好有两条 loader entry（本插件 + dsh-im）');
-assert.match(patch, /name: '@xmanrui\/dsh-im'/, '第二条 entry 的 name 必须等于包名（client 半边按 name 扫描）');
-assert.match(patch, /disabled: !!js/, 'dsh-im 那一行必须带 name 级防重复挂载守卫');
-assert.match(patch, /e\.options\.id !== 'dsh-plugin-wechat-session-dsh-im'/, '守卫必须带自排除，否则会把自身判成 disabled');
-ok('聚合包一次挂两个插件（第二条 name=@xmanrui/dsh-im 且带自排除守卫）');
+assert.equal(entryNameMatches.length, 1, 'patch 应恰好一条 loader entry（单插件）');
+assert.ok(!/@xmanrui\/dsh-im/.test(patch), 'patch 不应再引用 dsh-im');
+assert.ok(!/disabled: !!js/.test(patch), '单插件不需要防重守卫');
+ok('单插件：一条 loader entry，无 dsh-im、无防重守卫');
 
 for (const loc of ['en', 'zh']) {
   const dict = await readJson(`locale/${loc}.json`);
@@ -88,56 +100,458 @@ for (const f of ['lib/index.js', 'lib/client.js']) {
   assert.ok(!/\bsendKey\b/.test(src), `${f} 不应残留 sendKey 标识符`);
   assert.ok(!/globalThis\.fetch|fetch\(['"]https:/.test(src), `${f} 不应有外部 Webhook fetch`);
 }
-ok('代码彻底移除 Server 酱 / sctapi / sendKey（改走 dsh-im）');
+ok('代码彻底移除 Server 酱 / sctapi / sendKey（改走 iLink）');
 
-// ───────────────────── 2. Host half ─────────────────────
+// ───────────────────── 2. Host half（v2.1.0 通道外设版）─────────────────────
 const host = await import(new URL('../lib/index.js', import.meta.url).href);
 assert.equal(host.name, 'dsh-plugin-wechat-session');
+assert.equal(host.VERSION, '2.1.0', '版本须为 2.1.0');
 assert.deepEqual(host.inject, ['webServer', 'connection']);
 assert.equal(typeof host.apply, 'function');
-assert.match(host.WECHAT_ROUTE, /^\/__dsh-plugin-wechat-session\/wechat$/);
-assert.match(host.HEALTH_ROUTE, /^\/__dsh-plugin-wechat-session\/health$/);
-ok('lib/index.js 导出 name/inject/apply/路由常量');
+for (const r of ['WECHAT_ROUTE','HEALTH_ROUTE','LOGIN_ROUTE','LOGIN_STATUS_ROUTE','INBOUND_ROUTE','SESSIONS_ROUTE','QR_IMAGE_ROUTE','SETTINGS_ROUTE']) {
+  assert.match(host[r], /^\/__dsh-plugin-wechat-session\//, `${r} 应为插件路由`);
+}
+ok('lib/index.js 导出 name/VERSION=2.1.0/inject/apply/8 条路由常量（含 SETTINGS_ROUTE）');
 
-let rejection = undefined; // undefined = 放行；403 = 拒绝
-const sendCalls = [];      // 所有 ctx.dshIm.send 调用
-let sendResult = { sent: true };
-let sendThrow = null;      // 非 null 时让 dshIm.send 抛错（模拟 dsh-im 校验失败）
-const fakeImService = {
-  async send(botId, targetId, text, opts) {
-    sendCalls.push({ botId, targetId, text, opts });
-    if (sendThrow) throw sendThrow;
-    return sendResult;
-  },
-};
+// ── 2A. bridge.js 单元：sessionPrefix / parseInbound / ApprovalRegistry ──
+assert.equal(sessionPrefix('3f2a-9bcc-11dd'), '3f2a9b', '前缀应去非字母数字取前6位并小写');
+assert.equal(sessionPrefix('AB-CD', 4), 'abcd');
+// 回归【前缀碰撞】：真实会话 ID 多为 session-<uuid>，跳过公共开头避免全撞成 sessio
+const collisionA = sessionPrefix('session-91b2175-db79-4ec0-9bf6-dd44446ebe45');
+const collisionB = sessionPrefix('session-4bf2c3c3-e3f3-4d0a-9383-bfeb770d5e81');
+assert.notEqual(collisionA, collisionB, 'session- 开头的不同会话前缀不应碰撞');
+assert.equal(collisionA, '91b217', '应跳过 session- 公共开头取 UUID 段前6位');
+assert.equal(collisionB, '4bf2c3');
+assert.equal(sessionPrefix('session-ab'), 'ab', '短 ID 跳过开头后仍有内容时正常返回');
+ok('sessionPrefix：去非字母数字 + 小写 + 截长 + 跳过 session- 公共开头防碰撞');
 
-// Host 的 dshIm 是「软依赖」：apply 用 ctx.inject(['dshIm'], cb) 绑定。
-// mock 里复刻这个绑定，让 imService 指向 fakeImService。
-function makeHostCtx(config, opts = {}) {
-  const registered = [];
-  const imCtx = {
-    dshIm: opts.withIm === false ? undefined : fakeImService,
-    effect(fn) { const off = fn(); return typeof off === 'function' ? off : () => {}; },
+// 回归【错误中文化】：底层英文错误发微信前必须转成中文（用户看不懂英文）
+assert.match(humanizeError('session "session-ac2a3e51-25c8-4476-8935-69c29c226b77" not found'), /找不到该会话/, 'not found 应中文化');
+assert.match(humanizeError(new Error('Session not found')), /找不到该会话/, 'Error 对象的 message 也应中文化');
+assert.match(humanizeError('cannot get property "sessionController" without inject'), /服务未就绪/, 'inject 错误应中文化');
+assert.ok(/[\u4e00-\u9fa5]/.test(humanizeError('something timed out')), '超时错误应中文化');
+assert.equal(humanizeError('列举会话失败：already chinese'), '列举会话失败：already chinese', '已含中文的错误原样保留');
+ok('humanizeError：底层英文错误（not found/inject/timeout）中文化，已含中文原样保留');
+
+const binds = ['3f2a-9bcc-11dd'];
+const useParsed = parseInbound('/use 3f2a-9bcc-11dd', { explicitSessions: binds });
+assert.equal(useParsed.kind, 'use');
+assert.equal(useParsed.sessionId, '3f2a-9bcc-11dd');
+// 按标题绑定：中文「绑定 <标题>」与含中文/空格/· 的 /use <标题> → use-title
+const titleParsed = parseInbound('绑定 微信·甜屿林风', { explicitSessions: binds });
+assert.equal(titleParsed.kind, 'use-title', '中文绑定应解析为 use-title');
+assert.equal(titleParsed.title, '微信·甜屿林风');
+const titleParsed2 = parseInbound('/use 微信 · 甜屿林风', { explicitSessions: binds });
+assert.equal(titleParsed2.kind, 'use-title', '含空格与·的 /use 应解析为 use-title');
+assert.equal(titleParsed2.title, '微信 · 甜屿林风');
+assert.equal(parseInbound('bind Some Title', { explicitSessions: binds }).kind, 'use-title', '英文 bind 别名应解析为 use-title');
+assert.equal(parseInbound('/release', { explicitSessions: binds }).kind, 'release');
+assert.equal(parseInbound('/list', { explicitSessions: binds }).kind, 'list');
+assert.equal(parseInbound('?', { explicitSessions: binds }).kind, 'help');
+assert.equal(parseInbound('3f2a=1', { explicitSessions: binds }).outcome, 'allowed-once');
+assert.equal(parseInbound('3f2a=0', { explicitSessions: binds }).outcome, 'rejected');
+assert.equal(parseInbound('3f2a c', { explicitSessions: binds }).outcome, 'cancelled');
+assert.equal(parseInbound('3f2a=也许', { explicitSessions: binds }).kind, 'bad-decision');
+assert.equal(parseInbound('zzzz=1', { explicitSessions: binds }).kind, 'unknown-prefix');
+assert.equal(parseInbound('今天天气不错', { explicitSessions: binds }).kind, 'passthrough');
+// 选择题回复：<前缀> 1A 2B（数字+字母），须在决策之前被识别；未绑定前缀不 claim。
+const qrParsed = parseInbound('3f2a 1A 2BC', { explicitSessions: binds });
+assert.equal(qrParsed.kind, 'question-reply', '数字+字母应解析为选择题回复');
+assert.equal(qrParsed.prefix, '3f2a');
+assert.deepEqual(qrParsed.tokens, [{ index: 1, letters: 'A' }, { index: 2, letters: 'BC' }], '应支持多选字母');
+assert.equal(parseInbound('3f2a=1', { explicitSessions: binds }).kind, 'decision', '纯 =1 仍是审批决策');
+assert.equal(parseInbound('zzzz 1A', { explicitSessions: binds }).kind, 'passthrough', '未绑定前缀的选择回复不 claim，交回聊天');
+// v2.1.0：/new [标题] 薄创建会话；空标题 → title:'' 由宿主兜底固定标题。
+const newParsed = parseInbound('/new', { explicitSessions: binds });
+assert.equal(newParsed.kind, 'new', '/new 应解析为 thin-create 指令');
+assert.equal(newParsed.title, '');
+const newTitled = parseInbound('/new 我的微信会话', { explicitSessions: binds });
+assert.equal(newTitled.kind, 'new');
+assert.equal(newTitled.title, '我的微信会话', '/new <标题> 应带上标题');
+ok('parseInbound：/use|/release|/list|/help|前缀决策|选择题回复|/new|未知前缀|透传');
+
+// ApprovalRegistry：幂等 settle + 前缀寻址 + permissionPreset 降级 + 提醒上限
+const outcomes = [];
+const reg = new ApprovalRegistry({ prefixLength: 6, permissionPreset: 'ask', log: () => {} });
+reg.register({ id: 'r1', sessionId: '3f2a-9bcc-11dd', chatId: 'c', meta: { toolName: 'run' }, timeoutMs: 0, onSettle: (o) => outcomes.push(o) });
+assert.equal(reg.size(), 1);
+assert.equal(reg.resolveByPrefix('3f2a', 'allowed-once'), true, '按前缀应能结算');
+assert.equal(reg.resolveByPrefix('3f2a', 'rejected'), false, '重复结算应无效（幂等）');
+assert.deepEqual(outcomes, ['allowed-once']);
+ok('ApprovalRegistry：按会话前缀结算 + 幂等 settle');
+
+const reg2 = new ApprovalRegistry({ prefixLength: 6, permissionPreset: 'allow-once', log: () => {} });
+let f2; reg2.register({ id: 'r2', sessionId: 'aaaa-bbbb', timeoutMs: 15, onSettle: (o) => { f2 = o; } });
+await new Promise((r) => setTimeout(r, 40));
+assert.equal(f2, 'allowed-once', '超时应按 permissionPreset=allow-once 自动批准');
+reg2.dispose();
+ok('ApprovalRegistry：超时按 permissionPreset 自动降级');
+
+const reg3 = new ApprovalRegistry({ prefixLength: 6, permissionPreset: 'ask', remindIntervalMs: 10, maxReminders: 2, log: () => {} });
+let remindN = 0, f3;
+reg3.onRemind = () => { remindN++; };
+reg3.register({ id: 'r3', sessionId: 'cccc-dddd', timeoutMs: 0, onSettle: (o) => { f3 = o; } });
+await new Promise((r) => setTimeout(r, 45));
+assert.ok(remindN >= 1 && remindN <= 2, '提醒次数不应超过 maxReminders');
+assert.equal(f3, 'cancelled', '提醒耗尽后应按 ask→cancelled 自动结算');
+reg3.dispose();
+ok('ApprovalRegistry：延迟提醒上限 + 耗尽后自动降级');
+
+// 对话入站：passthrough 文本投给 /use 绑定的会话（submitPrompt 注入）
+{
+  const sent = [];
+  const prompts = [];
+  const dlg = createBridge({
+    config: { prefixLength: 6 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    submitPrompt: async (sid, text) => { prompts.push({ sid, text }); return { accepted: true }; },
+  });
+  // 未绑定时给提示、不调用 prompt
+  const before = await dlg.handleInbound('普通聊天');
+  assert.equal(before.action, 'no-session', '未绑定时不应转交');
+  assert.equal(prompts.length, 0);
+  assert.ok(sent.some((t) => t.includes('/use')), '未绑定应提示先 /use');
+  // /use 绑定后，普通文本转交
+  await dlg.handleInbound('/use session-abc123-def');
+  sent.length = 0;
+  const r = await dlg.handleInbound('在帮你情况下，还能多会话提醒吗？');
+  assert.equal(r.action, 'prompt', '绑定后应转交 prompt');
+  assert.equal(r.sessionId, 'session-abc123-def');
+  assert.equal(prompts.length, 1);
+  assert.deepEqual(prompts[0], { sid: 'session-abc123-def', text: '在帮你情况下，还能多会话提醒吗？' });
+  assert.equal(sent.length, 0, '转交后不应再发「等待回复」中间回执（正文镜像即反馈）');
+  dlg.dispose();
+  ok('对话入站：passthrough 文本投给 /use 绑定会话 + 未绑定提示');
+}
+
+// 绑定状态持久化：注入 bindingStore 后，启动 load 恢复、bind/release 时 save
+{
+  const disk = { sessions: ['session-restore-a', 'session-restore-b'], activeSession: 'session-restore-b' };
+  const store = {
+    load: () => ({ ...disk, sessions: [...disk.sessions] }),
+    save: (data) => { disk.sessions = [...data.sessions]; disk.activeSession = data.activeSession; },
   };
+  const b = createBridge({
+    config: { prefixLength: 6 },
+    bindingStore: store,
+    send: async () => {},
+    log: () => {},
+  });
+  // 启动恢复：集合 + 活跃会话都在，boundList 立即有值
+  assert.deepEqual(b.boundList().sort(), ['session-restore-a', 'session-restore-b']);
+  // 新增绑定应写回 store（含新的 activeSession）
+  b.bindSession('session-new-c');
+  assert.ok(disk.sessions.includes('session-new-c'), 'bind 后应持久化新会话');
+  assert.equal(disk.activeSession, 'session-new-c', 'bind 后应持久化活跃会话');
+  // releaseAll 应清空并写回
+  b.releaseAll();
+  assert.deepEqual(disk.sessions, [], 'release 后应持久化空集合');
+  assert.equal(disk.activeSession, null, 'release 后应清空活跃会话');
+  b.dispose();
+  // 不一致的持久化数据：activeSession 不在集合里 → 恢复为 null，不产生幽灵对话目标
+  const disk2 = { sessions: ['session-x'], activeSession: 'session-ghost' };
+  const store2 = { load: () => ({ ...disk2 }), save: () => {} };
+  const prompts2 = [];
+  const b2 = createBridge({
+    config: { prefixLength: 6 },
+    bindingStore: store2,
+    send: async () => {},
+    log: () => {},
+    submitPrompt: async (sid, text) => { prompts2.push({ sid, text }); return { accepted: true }; },
+  });
+  assert.deepEqual(b2.boundList(), ['session-x']);
+  const r = await b2.handleInbound('普通聊天');
+  assert.equal(r.action, 'no-session', '幽灵活跃会话应被清空，提示先绑定');
+  assert.equal(prompts2.length, 0, '幽灵活跃会话不应触发 prompt');
+  b2.dispose();
+  ok('绑定状态持久化：启动恢复 + bind/release 写回 + 幽灵活跃会话防护');
+}
+
+// 按标题绑定：resolveSessionByTitle 注入后，「绑定 <标题>」反查并绑定；多匹配/未找到/不可用分支
+{
+  const sent = [];
+  const mk = (resolver) => createBridge({
+    config: { prefixLength: 6 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    resolveSessionByTitle: resolver,
+  });
+  // 唯一命中 → 绑定成功
+  sent.length = 0;
+  let seenTitle = '';
+  const b1 = mk(async (t) => { seenTitle = t; return { ok: true, sessionId: 'session-titled-001', title: t }; });
+  const r1 = await b1.handleInbound('绑定 微信·甜屿林风');
+  assert.equal(r1.action, 'use-title');
+  assert.equal(r1.sessionId, 'session-titled-001');
+  assert.equal(seenTitle, '微信·甜屿林风', '应把标题原文交给解析器');
+  assert.ok(sent.some((t) => t.includes('微信·甜屿林风') && t.includes('已按标题')), '回执应含标题与绑定成功');
+  assert.ok(b1.boundList().includes('session-titled-001'), '绑定后会话应进 boundList');
+  b1.dispose();
+  // 多匹配 → 不绑定，列出候选
+  sent.length = 0;
+  const b2 = mk(async () => ({ ok: false, matches: [
+    { sessionId: 'session-A', title: '微信·甜屿林风' },
+    { sessionId: 'session-B', title: '微信·甜屿林风·2' },
+  ] }));
+  const r2 = await b2.handleInbound('绑定 微信');
+  assert.equal(r2.action, 'use-title-ambiguous');
+  assert.equal(b2.boundList().length, 0, '多匹配不应绑定');
+  assert.ok(sent.some((t) => t.includes('多个会话')), '应提示多个匹配');
+  b2.dispose();
+  // 未找到 → 不绑定
+  sent.length = 0;
+  const b3 = mk(async () => ({ ok: false, error: '未找到匹配标题' }));
+  const r3 = await b3.handleInbound('绑定 不存在');
+  assert.equal(r3.action, 'use-title-notfound');
+  assert.equal(b3.boundList().length, 0);
+  assert.ok(sent.some((t) => t.includes('未找到')), '应提示未找到');
+  b3.dispose();
+  // 解析器不可用 → 提示改用全 ID
+  sent.length = 0;
+  const b4 = createBridge({ config: { prefixLength: 6 }, send: async (t) => { sent.push(t); }, log: () => {} });
+  const r4 = await b4.handleInbound('绑定 微信·甜屿林风');
+  assert.equal(r4.action, 'use-title-unavailable');
+  assert.ok(sent.some((t) => t.includes('不可用')), '应提示按标题绑定不可用');
+  b4.dispose();
+  ok('按标题绑定：唯一命中绑定/多匹配候选/未找到/不可用四分支');
+}
+
+// 卡片指令 /use <前缀>：resolveSessionByPrefix 注入后反查成完整 sessionId 再绑定
+{
+  const sent = [];
+  const mk = (resolver) => createBridge({
+    config: { prefixLength: 6 },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    resolveSessionByPrefix: resolver,
+  });
+  // 唯一命中 → 反查绑定完整 ID
+  sent.length = 0;
+  let seenPrefix = '';
+  const b1 = mk(async (p) => {
+    seenPrefix = p;
+    return { ok: true, sessionId: 'session-91b2175-db79-4ec0' };
+  });
+  const r1 = await b1.handleInbound('/use 91b217');
+  assert.equal(r1.action, 'use');
+  assert.equal(r1.sessionId, 'session-91b2175-db79-4ec0', '前缀应反查为完整 sessionId');
+  assert.equal(seenPrefix, '91b217', '应把前缀原文交给解析器');
+  assert.ok(b1.boundList().includes('session-91b2175-db79-4ec0'), '反查后完整 ID 应进 boundList');
+  assert.ok(sent.some((t) => t.includes('按前缀匹配')), '回执应标注按前缀匹配');
+  b1.dispose();
+  // 反查不到 → 回退字面绑定（保持完整 ID 兼容）
+  sent.length = 0;
+  const b2 = mk(async () => ({ ok: false, error: '未找到匹配前缀' }));
+  const r2 = await b2.handleInbound('/use 3f2a9b');
+  assert.equal(r2.action, 'use');
+  assert.equal(r2.sessionId, '3f2a9b', '反查失败应回退字面绑定');
+  b2.dispose();
+  ok('卡片 /use <前缀>：反查绑定完整 ID + 失败回退字面（完整 ID 兼容）');
+}
+
+// v2.1.0：/new 薄创建会话 —— createSession 注入后创建 + 立即绑定；默认标题兜底。
+{
+  const sent = [];
+  let seenTitle = '';
+  const b = createBridge({
+    config: { prefixLength: 6, newSessionTitle: '微信 · Clawbot' },
+    send: async (t) => { sent.push(t); },
+    log: () => {},
+    createSession: async (title) => {
+      seenTitle = title;
+      return { ok: true, sessionId: 'session-new-aaa111', title };
+    },
+  });
+  // 空标题 → 用配置里的默认标题
+  const r1 = await b.handleInbound('/new');
+  assert.equal(r1.action, 'new');
+  assert.equal(r1.sessionId, 'session-new-aaa111');
+  assert.equal(seenTitle, '微信 · Clawbot', '空标题应兜底为默认标题');
+  assert.ok(b.boundList().includes('session-new-aaa111'), '新建会话应立即绑定');
+  assert.ok(sent.some((t) => t.includes('已新建会话') && t.includes('session-new-aaa111')), '应有新建并绑定回执');
+  // 自定义标题
+  const r2 = await b.handleInbound('/new 我的会话');
+  assert.equal(r2.action, 'new');
+  assert.equal(seenTitle, '我的会话', '/new <标题> 应透传自定义标题给 createSession');
+  b.dispose();
+  // 未注入 createSession → new-unavailable
+  const b2 = createBridge({ config: {}, send: async () => {}, log: () => {} });
+  const r3 = await b2.handleInbound('/new');
+  assert.equal(r3.action, 'new-unavailable', '无 createSession 时应优雅降级');
+  b2.dispose();
+  ok('/new 薄创建：默认标题兜底 + 自定义标题 + 立即绑定 + 无解析器降级');
+}
+
+// v2.1.0：settings-store 工作目录持久化（零依赖、坏文件降级）
+{
+  const f = '__dsh_ws_settings__.json';
+  const store = createSettingsStore(f);
+  await writeFile(f, JSON.stringify({ newSessionCwd: 'D:\\ws\\wechat' }), 'utf8');
+  assert.equal(store.load().newSessionCwd, 'D:\\ws\\wechat', '应读回工作目录');
+  store.save({ newSessionCwd: 'F:\\workspace\\new' });
+  assert.equal(store.load().newSessionCwd, 'F:\\workspace\\new', '保存后应可读回');
+  await writeFile(f, '{bad json', 'utf8');
+  assert.equal(store.load().newSessionCwd, '', '坏文件应静默降级为空');
+  await unlink(f).catch(() => {});
+  ok('settings-store：工作目录读写 + 坏文件降级');
+}
+
+// 选择题（ask_user_question）：user-questions/request waterfall 应答者 + 微信卡 + token 回填
+{
+  const sent = [];
+  const qb = createBridge({ config: { prefixLength: 6, questionTimeoutMs: 0 }, send: async (t) => { sent.push(t); }, log: () => {} });
+  const agent = { session: { id: 'session-91b2175-db79-4ec0' } };
+  const questions = [
+    { id: 'q1', question: '恢复范围？', options: [{ label: '只恢复微信图标' }, { label: '恢复全渠道图标' }, { label: '暂不' }] },
+    { id: 'q2', question: '标题来源？', multiSelect: true, options: [{ label: '保持现状' }, { label: '自动加前缀' }, { label: '其他' }] },
+  ];
+  // 未绑定会话也能回填（m04261 核心回归）：client 富格式卡对所有会话发，
+  // 即使该会话从未 /use 绑定，微信回「前缀 1A 2B」也必须命中待决池而非误投自由对话。
+  sent.length = 0;
+  const unboundPromise = qb.onUserQuestions({ agent, questions, wait: { callId: 'cq0' } });
+  const r0 = await qb.handleInbound('91b217 1A 2B');
+  assert.equal(r0.action, 'question-reply', '未绑定会话的前缀也应被识别为选择题回填');
+  assert.equal(r0.ok, true, '未绑定会话应能结算待决选择题');
+  const unboundAnswer = await unboundPromise;
+  assert.deepEqual(unboundAnswer.answers, [
+    { id: 'q1', selected: ['只恢复微信图标'] },
+    { id: 'q2', selected: ['自动加前缀'] },
+  ], '未绑定会话回填应按题 id + 选项 label 精确映射（1A=只恢复微信图标，2B=自动加前缀）');
+  // 绑定后发起请求：停发即时短卡，返回 Promise（回调返回即回填）
+  await qb.handleInbound('/use session-91b2175-db79-4ec0');
+  sent.length = 0;
+  const answerPromise = qb.onUserQuestions({ agent, questions, wait: { callId: 'cq1' } });
+  assert.equal(sent.length, 0, '停发即时选择短卡：host 只保留待决注册，[需要选择] 卡由 client 富格式卡承担');
+  // 微信回复 91b217 1A 2BC → 按 label 精确回填
+  const r = await qb.handleInbound('91b217 1A 2BC');
+  assert.equal(r.action, 'question-reply');
+  assert.equal(r.ok, true, '应结算待决选择题');
+  const answer = await answerPromise;
+  assert.deepEqual(answer.answers, [
+    { id: 'q1', selected: ['只恢复微信图标'] },
+    { id: 'q2', selected: ['自动加前缀', '其他'] },
+  ], '应按题 id + 选项 label 回填（A=第1项/B=第2项/C=第3项，支持多选）');
+  // 带 intent 的题是审批语义，不 claim（无 next 时返回 undefined）
+  const intentAns = await qb.onUserQuestions({ agent, questions: [{ id: 'q3', question: '批准?', intent: { kind: 'approval', approve: 'y', reject: 'n' } }] });
+  assert.equal(intentAns, undefined, '带 intent 的题应交回 approval 链路');
+  qb.dispose();
+  ok('选择题：任意会话（含未绑定）回填 + 字母→label + 多选 + intent 跳过');
+}
+
+// 出站流式聚合：agent/assistant-stream 的 text-delta 聚合后在 end 一次性投递微信
+{
+  const sent = [];
+  const stream = createBridge({
+    config: { prefixLength: 6 },
+    send: async (t) => { sent.push(t); },
+    // 正文抬头走标题解析器；未命中时由 bridge 退回短前缀
+    sessionTitle: async (sid) => (sid === 'session-stream-xyz' ? '甜屿林风' : ''),
+    log: () => {},
+  });
+  await stream.handleInbound('/use session-stream-xyz');
+  sent.length = 0;
+  const sid = 'session-stream-xyz';
+  // a1 = 最终回复：start → 多个 chunk（正文 + 思考）→ end(committed/assistant/message)
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'start', attemptId: 'a1', revision: 0 } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'chunk', attemptId: 'a1', revision: 1, chunk: { type: 'text-delta', text: '你好' } } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'chunk', attemptId: 'a1', revision: 2, chunk: { type: 'reasoning-delta', text: '思考中' } } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'chunk', attemptId: 'a1', revision: 3, chunk: { type: 'text-delta', text: '，有什么帮忙？' } } });
+  assert.equal(sent.length, 0, 'end 之前不应投递，避免逐分片刷屏');
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'end', attemptId: 'a1', revision: 4, outcome: { kind: 'committed', eventType: 'assistant/message' } } });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 1, '最终回复 committed/assistant/message 应一次性投递');
+  assert.ok(sent[0].includes('你好，有什么帮忙？'), '应聚合正文且跳过 reasoning');
+  assert.ok(!sent[0].includes('思考中'), '不应投递思考过程');
+  assert.ok(sent[0].startsWith('DeepSeek Harness · 会话「甜屿林风」'), '正文镜像应以可读标题抬头');
+  assert.ok(!sent[0].includes('[stream]'), '正文镜像不应再出现难懂的短码前缀');
+
+  // a2 = 工具循环中的中间播报：committed/assistant/attempt，不得投递
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'start', attemptId: 'a2', revision: 0 } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'chunk', attemptId: 'a2', revision: 1, chunk: { type: 'text-delta', text: '我先查一下源码' } } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'end', attemptId: 'a2', revision: 2, outcome: { kind: 'committed', eventType: 'assistant/attempt' } } });
+  // a3 = 被放弃的 attempt：abandoned，不得投递
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'start', attemptId: 'a3', revision: 0 } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'chunk', attemptId: 'a3', revision: 1, chunk: { type: 'text-delta', text: '放弃的内容' } } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'end', attemptId: 'a3', revision: 2, outcome: { kind: 'abandoned' } } });
+  // a4 = 无 outcome 的 end（旧帧），不得投递
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'start', attemptId: 'a4', revision: 0 } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'chunk', attemptId: 'a4', revision: 1, chunk: { type: 'text-delta', text: '无 outcome' } } });
+  stream.onAssistantStream({ agent: { session: { id: sid } }, frame: { type: 'end', attemptId: 'a4', revision: 2 } });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 1, 'intermediate/attempt + abandoned + 无 outcome 的 end 一律不投递，微信只留最终回复');
+
+  // onSessionEvent 跳过 assistant/* 正文类事件，避免与流式最终回复重复投递 / 漏出中间播报
+  stream.onSessionEvent({ id: sid }, { type: 'assistant/message', data: { message: { content: '最终回复（事件通道）' } } });
+  stream.onSessionEvent({ id: sid }, { type: 'assistant/attempt', data: { stream: [] } });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 1, 'session/event 的 assistant/* 事件应跳过，避免重复/中间播报');
+
+  // 未绑定会话的帧应忽略
+  sent.length = 0;
+  stream.onAssistantStream({ agent: { session: { id: 'unbound-session' } }, frame: { type: 'chunk', attemptId: 'u1', revision: 1, chunk: { type: 'text-delta', text: 'x' } } });
+  stream.onAssistantStream({ agent: { session: { id: 'unbound-session' } }, frame: { type: 'end', attemptId: 'u1', revision: 2, outcome: { kind: 'committed', eventType: 'assistant/message' } } });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 0, '未绑定会话的流式帧应忽略');
+  stream.dispose();
+  ok('出站流式：仅 committed/assistant/message 投递 + 中间播报/放弃/无 outcome 跳过 + session/event assistant/* 跳过 + 未绑定忽略');
+}
+
+// ── 2B. Host apply：7 路由 + 官方 seam + 准入裁决 ──
+const STATE_MAIN = '__dsh_ws_main_state__.json';
+const STATE_IDLE = '__dsh_ws_idle_state__.json';   // 故意不存在 → 未登录
+const STATE_LOGIN = '__dsh_ws_login_state__.json';
+const BINDING_FILE = '__dsh_ws_bindings__.json';   // 绑定持久化：隔离到临时文件，不污染真实状态
+const SETTINGS_FILE = '__dsh_ws_settings_host__.json'; // /new 工作目录持久化：隔离到临时文件
+const okFetch = async (url, init) => {
+  const u = String(url);
+  let body = { ret: 0 };
+  if (u.includes('getupdates')) {
+    // 长轮询挂起直到 abort（保持 ready 状态且 dispose 后能干净退出）
+    return new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+  }
+  if (u.includes('getconfig')) body = { typing_ticket: 'TICKET_SMOKE' };
+  return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+};
+await writeFile(STATE_MAIN, JSON.stringify({
+  token: 'TOKEN_SMOKE', botId: 'BOT_SMOKE', baseUrl: '', userId: 'USER_SMOKE',
+  getUpdatesBuf: '', typingTicket: '', typingTicketAt: 0,
+}));
+let rejection = undefined; // undefined = 放行
+const allHostCtxs = []; // 收集所有 host ctx，末尾统一 dispose 停掉长轮询
+function makeHostCtx(config = {}, opts = {}) {
+  const registered = [];
+  const events = {};
+  const cleanups = [];
   const ctx = {
     logger: { info() {}, warn() {} },
     connection: { requestRejection() { return rejection; } },
     webServer: { register(route) { registered.push(route); return () => {}; } },
-    inject(names, cb) { if (names.includes('dshIm') && !opts.noInject) cb(imCtx); },
-    effect(fn) { const off = fn(); return typeof off === 'function' ? off : () => {}; },
+    on(name, fn) { events[name] = fn; return () => {}; },
+    effect(fn) { cleanups.push(fn); return () => {}; },
   };
-  host.apply(ctx, config);
-  return { ctx, registered };
+  if (typeof opts.decorate === 'function') opts.decorate(ctx);
+  host.apply(ctx, { stateFile: opts.stateFile || STATE_MAIN, bindingFile: opts.bindingFile || BINDING_FILE, settingsFile: opts.settingsFile || SETTINGS_FILE, fetchImpl: opts.fetchImpl || okFetch, ...config });
+  const wrapped = {
+    ctx, registered, events,
+    dispose() { for (const c of cleanups) { try { const off = c(); off?.(); } catch { /* ignore */ } } },
+  };
+  allHostCtxs.push(wrapped);
+  return wrapped;
 }
+const hc = makeHostCtx();
+const hcIdle = makeHostCtx({}, { stateFile: STATE_IDLE }); // 故意未登录，用于 502/idle 断言
+assert.equal(hc.registered.length, 8, '应注册 8 条 exact 路由（含 SETTINGS_ROUTE）');
+assert.ok(hc.registered.every((r) => r.kind === 'exact' && typeof r.handler === 'function'));
+assert.equal(typeof hc.events['session/event'], 'function', '应订阅 session/event');
+assert.equal(typeof hc.events['agent/assistant-stream'], 'function', '应订阅 agent/assistant-stream（dsh 0.1.5 起 live 正文走这里）');
+assert.equal(typeof hc.events['approval/request'], 'function', '应订阅 approval/request');
+assert.equal(typeof hc.events['user-questions/request'], 'function', '应订阅 user-questions/request（选择题）');
+ok('apply：8 条 exact 路由 + session/event + agent/assistant-stream + approval/request + user-questions/request 官方 seam');
 
-const { registered } = makeHostCtx({ botId: 'HOST_BOT', targetId: 'HOST_TARGET' });
-assert.equal(registered.length, 2, '应注册 2 条 exact 路由');
-assert.ok(registered.every((r) => r.kind === 'exact' && typeof r.handler === 'function'));
-ok('apply 注册 2 条 exact 路由（含准入裁决）');
-
-const wechatRoute = registered.find((r) => r.path === host.WECHAT_ROUTE);
-const healthRoute = registered.find((r) => r.path === host.HEALTH_ROUTE);
-assert.ok(wechatRoute && healthRoute);
+const route = (p) => hc.registered.find((r) => r.path === p);
 
 function makeRes() {
   return {
@@ -170,127 +584,323 @@ function invoke(handler, req) {
 
 // 2a. 准入拒绝 → 403
 rejection = 403;
-let res = await invoke(healthRoute.handler, makeReq('GET', null));
+let res = await invoke(route(host.HEALTH_ROUTE).handler, makeReq('GET', null));
 assert.equal(res.code, 403);
 rejection = undefined;
 ok('requestRejection 非 undefined 时拒绝（403）');
 
-// 2b. health 放行 → 200，报 hasServerTarget / dshImReady
-res = await invoke(healthRoute.handler, makeReq('GET', null));
+// 2b. health 放行 → 200，报 v2 新字段（已登录态 wechatReady: true）
+res = await invoke(route(host.HEALTH_ROUTE).handler, makeReq('GET', null));
 assert.equal(res.code, 200);
 const health = JSON.parse(res.body);
-assert.equal(health.hasServerTarget, true);
-assert.equal(health.dshImReady, true);
-ok('health 路由放行并返回 hasServerTarget / dshImReady');
+assert.equal(health.name, 'dsh-plugin-wechat-session');
+assert.equal(health.version, '2.1.0');
+assert.equal(health.wechatReady, true, 'STATE_MAIN 有 token，wechatReady 应为 true');
+assert.equal(typeof health.boundSessions, 'number');
+assert.equal(health.loginStatus, 'ready');
+ok('health 返回 name/version/wechatReady/loginStatus/boundSessions');
 
-// 2c. 非 POST → 405
-res = await invoke(wechatRoute.handler, makeReq('GET', null));
+// 2c. wechat 非 POST → 405
+res = await invoke(route(host.WECHAT_ROUTE).handler, makeReq('GET', null));
 assert.equal(res.code, 405);
 ok('wechat 路由拒绝非 POST（405）');
 
-// 2d. 缺 Bot ID / 目标 ID → 400 missing-target（页面没给、服务端也没配）
-const empty = makeHostCtx({});
-const wEmpty = empty.registered.find((r) => r.path === host.WECHAT_ROUTE);
-res = await invoke(wEmpty.handler, makeReq('POST', JSON.stringify({ title: 'x' })));
+// 2d. wechat 空文本 → 400 missing-text
+res = await invoke(route(host.WECHAT_ROUTE).handler, makeReq('POST', JSON.stringify({})));
 assert.equal(res.code, 400);
-assert.equal(JSON.parse(res.body).error, 'missing-target');
-ok('缺 Bot ID / 目标 ID 时报 400 missing-target');
+assert.equal(JSON.parse(res.body).error, 'missing-text');
+ok('wechat 空提醒内容 → 400 missing-text');
 
-// 2e. dsh-im 主动投递：校验 send(botId,targetId,text,{signal}) 参数
-sendCalls.length = 0;
-sendResult = { sent: true };
-res = await invoke(wechatRoute.handler, makeReq('POST', JSON.stringify({
-  title: 'DSH 需要你看一下',
-  desp: '离开窗口超过 30 秒没有回来：\n\n- 需要确认权限·会话A',
-  botId: 'PAGE_BOT',
-  targetId: 'PAGE_TARGET',
-})));
-assert.equal(res.code, 200, '投递成功应回 200');
+// 2e. 未扫码登录时 wechat 投递 → 502（iLink 无 token）
+res = await invoke(hcIdle.registered.find((r) => r.path === host.WECHAT_ROUTE).handler,
+  makeReq('POST', JSON.stringify({ title: '未登录', desp: 'test' })));
+assert.equal(res.code, 502);
+assert.match(JSON.parse(res.body).error, /扫码登录/);
+ok('未扫码登录时 wechat 投递返回 502');
+
+// 2f. login-status 放行 → 200，已登录态 ready
+res = await invoke(route(host.LOGIN_STATUS_ROUTE).handler, makeReq('GET', null));
+assert.equal(res.code, 200);
+assert.equal(JSON.parse(res.body).status, 'ready');
+ok('login-status 返回已登录 ready 状态');
+
+// 2g. 无二维码时 qr.png → 404
+res = await invoke(route(host.QR_IMAGE_ROUTE).handler, makeReq('GET', null));
+assert.equal(res.code, 404);
+ok('无二维码时 qr.png → 404');
+
+// 2h. inbound /use → 显式绑定会话
+res = await invoke(route(host.INBOUND_ROUTE).handler, makeReq('POST', JSON.stringify({ text: '/use 3f2a-9bcc-11dd' })));
+assert.equal(res.code, 200);
+assert.equal(JSON.parse(res.body).action, 'use');
+ok('inbound /use 显式绑定会话');
+
+// 2i. sessions 查看已绑定会话与前缀
+res = await invoke(route(host.SESSIONS_ROUTE).handler, makeReq('GET', null));
+assert.equal(res.code, 200);
+const sessions = JSON.parse(res.body);
+assert.ok(sessions.bound.some((b) => b.prefix === '3f2a9b'), '应能看到已绑定会话前缀');
+ok('sessions 返回已绑定会话及前缀');
+
+// 2j. approval seam：未绑定会话与原生 UI 竞答——next() 先答时透传 UI 决策，不掐断原生界面。
+// m04261 核心：未 /use 绑定的会话（如 /new 新建的会话）审批也要能被原生 UI 处理。
+const unboundDecided = hc.events['approval/request'](
+  { agent: { session: { id: 'zzzz-other' } }, callId: 'call-unbound', toolName: 'run' },
+  async () => 'rejected', // 模拟原生 UI 应答器先结算
+);
+const unboundOutcome = await unboundDecided;
+assert.equal(unboundOutcome, 'rejected', '未绑定会话：原生 UI 先答时应透传其决策（不 veto）');
+ok('approval/request：未绑定会话与原生 UI 竞答，UI 先答透传');
+
+// 2j2. 核心回归 m04261：未绑定会话的审批卡，微信回「前缀=1」也要精确回填到那个会话，
+// 而不是掉进自由对话分支误投给 activeSession。前缀从待决池反查（非绑定集合）。
+const otherApprovalPromise = hc.events['approval/request'](
+  { agent: { session: { id: '9a3b7c-other-session' } }, callId: 'call-other', toolName: 'Edit' },
+  () => new Promise(() => {}), // 原生 UI 仍在等用户点击，不先结算；让微信回填赢
+);
+res = await invoke(route(host.INBOUND_ROUTE).handler, makeReq('POST', JSON.stringify({ text: '9a3b7c=1' })));
+assert.equal(res.code, 200);
+const otherDecided = await otherApprovalPromise;
+assert.equal(otherDecided, 'allowed-once', '未绑定会话的审批也应能被微信「前缀=1」回填');
+ok('approval/request：未绑定会话审批卡可被微信前缀回填（m04261 核心）');
+
+// 2k. approval seam：已绑定会话返回决策 Promise，微信 <前缀>=1 精确批准
+const approvalPromise = hc.events['approval/request']({ agent: { session: { id: '3f2a-9bcc-11dd' } }, callId: 'call1', toolName: 'run' });
+res = await invoke(route(host.INBOUND_ROUTE).handler, makeReq('POST', JSON.stringify({ text: '3f2a=1' })));
+assert.equal(res.code, 200);
+const decided = await approvalPromise;
+assert.equal(decided, 'allowed-once', '微信回复 3f2a=1 应批准该会话的审批');
+ok('approval/request：绑定会话返回 Promise，<前缀>=1 精确批准');
+
+// 2k2. 回归【cordis 严格 inject】：ctx.sessionController 属性访问抛错时，对话入站仍走 ctx.get() 软获取
+{
+  const prompts = [];
+  const hcStrict = makeHostCtx({}, {
+    stateFile: STATE_MAIN,
+    decorate(cctx) {
+      // 模拟 cordis：未 inject 的属性直接抛错；get() 能软取到已注册服务。
+      Object.defineProperty(cctx, 'sessionController', {
+        configurable: true,
+        get() { throw new Error('cannot get property "sessionController" without inject'); },
+      });
+      cctx.get = (key) => key === 'sessionController'
+        ? { prompt: async (req) => { prompts.push(req); return { accepted: true }; } }
+        : undefined;
+    },
+  });
+  const inbox = hcStrict.registered.find((r) => r.path === host.INBOUND_ROUTE);
+  await invoke(inbox.handler, makeReq('POST', JSON.stringify({ text: '/use session-strict-inject' })));
+  const dlgRes = await invoke(inbox.handler, makeReq('POST', JSON.stringify({ text: '严格 inject 下应能转交' })));
+  assert.equal(JSON.parse(dlgRes.body).action, 'prompt', '属性访问抛错时仍应通过 ctx.get 转交，不再「转交失败」');
+  assert.equal(prompts.length, 1, 'prompt 应被调用一次');
+  assert.equal(prompts[0].sessionId, 'session-strict-inject');
+  assert.equal(prompts[0].mode, 'queue');
+  assert.deepEqual(prompts[0].content, [{ type: 'text', text: '严格 inject 下应能转交' }]);
+  ok('回归【cordis 严格 inject】：对话入站走 ctx.get()，不再「转交失败」');
+}
+
+// 2k4. 回归【归档会话发消息】：宿主 prompt 不检查归档、会把消息静默入队；
+// submitPrompt 必须在投递前查 workspaceRegistry.archivedSessionIds，明确拒绝。
+// 真删除的会话 prompt 会抛 session "..." not found，由既有 catch 分支中文化提示。
+{
+  const archivedSent = [];
+  const archivedPrompts = [];
+  const archivedFetch = async (url, init) => {
+    let body = { ret: 0 };
+    if (String(url).includes('getupdates')) {
+      return new Promise((_res, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('aborted')), { once: true }));
+    }
+    if (String(url).includes('sendmessage')) {
+      try { archivedSent.push(JSON.parse(init.body).msg.item_list[0].text_item.text); } catch { /* ignore */ }
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  };
+  const hcArch = makeHostCtx({}, {
+    stateFile: STATE_MAIN,
+    fetchImpl: archivedFetch,
+    decorate(cctx) {
+      cctx.get = (key) => key === 'sessionController'
+        ? { prompt: async (req) => { archivedPrompts.push(req); return { accepted: true }; } }
+        : key === 'workspaceRegistry'
+          ? { archivedSessionIds: new Set(['session-archived-xyz']) }
+          : undefined;
+    },
+  });
+  const archInbox = hcArch.registered.find((r) => r.path === host.INBOUND_ROUTE);
+  // 绑定一个「已归档」会话，再发普通文本
+  await invoke(archInbox.handler, makeReq('POST', JSON.stringify({ text: '/use session-archived-xyz' })));
+  archivedSent.length = 0;
+  const archRes = await invoke(archInbox.handler, makeReq('POST', JSON.stringify({ text: '归档后发的消息' })));
+  assert.equal(archRes.code, 200);
+  assert.equal(archivedPrompts.length, 0, '已归档会话不应调用 prompt（否则消息静默入队）');
+  assert.ok(archivedSent.some((t) => t.includes('已归档')), '应明确提示会话已归档/已删除');
+  assert.ok(archivedSent.some((t) => t.includes('/new')), '归档提示应引导用 /new 创建新会话');
+  ok('回归【归档会话发消息】：投递前查 archivedSessionIds，拒绝并提示 /use 与 /new，不再静默入队');
+}
+
+// 2k3. 按标题绑定端到端：走 index.js resolveSessionByTitle（sessionController.list + sessionQuery.readTitle）
+{
+  const prompts = [];
+  const hcTitle = makeHostCtx({}, {
+    stateFile: STATE_MAIN,
+    decorate(cctx) {
+      // 严格 inject：属性访问抛错，只经 ctx.get 软取。
+      for (const key of ['sessionController', 'sessionQuery']) {
+        Object.defineProperty(cctx, key, {
+          configurable: true,
+          get() { throw new Error(`cannot get property "${key}" without inject`); },
+        });
+      }
+      cctx.get = (key) => {
+        if (key === 'sessionController') return {
+          list: async () => ({ items: [
+            { sessionId: 'session-title-e2e-001' },
+            { sessionId: 'session-other' },
+          ] }),
+          prompt: async (req) => { prompts.push(req); return { accepted: true }; },
+        };
+        if (key === 'sessionQuery') return {
+          readTitle: async (sid) => ({
+            title: sid === 'session-title-e2e-001' ? '微信 · 甜屿林风' : '另一个会话',
+          }),
+        };
+        return undefined;
+      };
+    },
+  });
+  const inbox = hcTitle.registered.find((r) => r.path === host.INBOUND_ROUTE);
+  // 用带空格/·的标题（用户真实输入形态）绑定
+  const bindRes = await invoke(inbox.handler, makeReq('POST', JSON.stringify({ text: '绑定 微信 · 甜屿林风' })));
+  const bindBody = JSON.parse(bindRes.body);
+  assert.equal(bindBody.action, 'use-title', '按标题应解析为 use-title');
+  assert.equal(bindBody.sessionId, 'session-title-e2e-001', '应反查到唯一匹配的 sessionId');
+  // 绑定后普通文本应转交到该会话
+  const dlgRes = await invoke(inbox.handler, makeReq('POST', JSON.stringify({ text: '标题绑定后发消息' })));
+  const dlgBody = JSON.parse(dlgRes.body);
+  assert.equal(dlgBody.action, 'prompt');
+  assert.equal(dlgBody.sessionId, 'session-title-e2e-001');
+  assert.equal(prompts.length, 1, 'prompt 应被调用一次');
+  assert.equal(prompts[0].sessionId, 'session-title-e2e-001');
+  ok('按标题绑定端到端：严格 inject 下 list+readTitle 反查唯一会话并对话');
+}
+
+// 2k4. /new 端到端：工作目录→workspaceId 进分组 + 自定义标题加「微信 · 」前缀 + resume→rename + 立即绑定
+{
+  const WS_SETTINGS_FILE = '__dsh_ws_new_settings_host__.json';
+  const calls = [];
+  const hcNew = makeHostCtx({}, {
+    settingsFile: WS_SETTINGS_FILE,
+    decorate(cctx) {
+      // 严格 inject：属性访问抛错，只经 ctx.get 软取。
+      for (const key of ['sessionController', 'workspaceController']) {
+        Object.defineProperty(cctx, key, {
+          configurable: true,
+          get() { throw new Error(`cannot get property "${key}" without inject`); },
+        });
+      }
+      cctx.get = (key) => {
+        if (key === 'workspaceController') return {
+          create: async (req) => {
+            calls.push({ kind: 'ws-create', path: req.path });
+            return { workspace: { workspaceId: 'ws-aaa111', path: req.path }, created: true };
+          },
+        };
+        if (key === 'sessionController') return {
+          create: async (req) => {
+            calls.push({ kind: 'session-create', req });
+            return { sessionId: 'session-new-ac2a3e' };
+          },
+          resume: async (req) => { calls.push({ kind: 'resume', req }); return {}; },
+          rename: async (req) => { calls.push({ kind: 'rename', req }); return { title: req.title, seq: 1 }; },
+          prompt: async (req) => { calls.push({ kind: 'prompt', req }); return { accepted: true }; },
+          list: async () => ({ items: [{ sessionId: 'session-new-ac2a3e' }] }),
+        };
+        return undefined;
+      };
+    },
+  });
+  // 先经设置路由写入工作目录（即时保存的宿主侧入口）
+  const settingsHandler = hcNew.registered.find((r) => r.path === host.SETTINGS_ROUTE);
+  assert.ok(settingsHandler, '应注册 SETTINGS_ROUTE');
+  const setRes = await invoke(settingsHandler.handler, makeReq('POST', JSON.stringify({ newSessionCwd: 'F:\\ws\\wechat' })));
+  assert.equal(setRes.code, 200, 'POST /settings 应成功');
+  assert.equal(JSON.parse(setRes.body).newSessionCwd, 'F:\\ws\\wechat', '工作目录应写入');
+  // 发 /new 带自定义标题
+  const inbox = hcNew.registered.find((r) => r.path === host.INBOUND_ROUTE);
+  const newRes = await invoke(inbox.handler, makeReq('POST', JSON.stringify({ text: '/new 甜屿林风1' })));
+  const newBody = JSON.parse(newRes.body);
+  assert.equal(newBody.action, 'new', '/new 应解析为 new');
+  assert.equal(newBody.sessionId, 'session-new-ac2a3e', '应绑定 create 返回的真实 sessionId');
+  // 工作区：workspace/create({path}) → create({workspaceId})，不是 cwd
+  const wsCreate = calls.find((c) => c.kind === 'ws-create');
+  assert.ok(wsCreate && wsCreate.path === 'F:\\ws\\wechat', '应先把工作目录注册为工作区');
+  const sessionCreate = calls.find((c) => c.kind === 'session-create');
+  assert.deepEqual(sessionCreate.req, { workspaceId: 'ws-aaa111' }, 'create 应收到 workspaceId 而非 cwd（确保进分组）');
+  // 命名：resume → rename，标题带「微信 · 」前缀
+  const resumeIdx = calls.findIndex((c) => c.kind === 'resume');
+  const renameIdx = calls.findIndex((c) => c.kind === 'rename');
+  assert.ok(resumeIdx >= 0 && renameIdx > resumeIdx, 'rename 前应先 resume 会话');
+  assert.equal(calls[renameIdx].req.title, '微信 · 甜屿林风1', '自定义标题应加「微信 · 」前缀');
+  assert.equal(newBody.title, '微信 · 甜屿林风1', '回执应返回带前缀的标题');
+  // 立即绑定：boundList 含新会话，之后普通文本投给它
+  assert.ok(hcNew.ctx && newBody.sessionId, '会话应立即绑定');
+  await unlink(WS_SETTINGS_FILE).catch(() => {});
+  ok('/new 端到端：工作目录→workspaceId 进分组 + 标题加「微信 · 」前缀 + resume→rename + 立即绑定');
+}
+
+// 2l. 已登录 + iLink mock：wechat 主动投递成功（走 iLink，不涉及 dsh-im）
+const DELIVER_STATE = '__dsh_ws_deliver_state__.json';
+await writeFile(DELIVER_STATE, JSON.stringify({
+  token: 'TOKEN_SMOKE', botId: 'BOT_SMOKE', baseUrl: '', userId: 'USER_SMOKE',
+  getUpdatesBuf: '', typingTicket: '', typingTicketAt: 0,
+}));
+const deliverFetch = async (url, init) => {
+  const u = String(url);
+  let body = { ret: 0 };
+  if (u.includes('getupdates')) body = { ret: -14, errcode: -14 }; // 让收消息循环立即退出，避免空转
+  else if (u.includes('getconfig')) body = { typing_ticket: 'TICKET_SMOKE' };
+  return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+};
+const hcDeliver = makeHostCtx({ stateFile: DELIVER_STATE, fetchImpl: deliverFetch });
+res = await invoke(hcDeliver.registered.find((r) => r.path === host.WECHAT_ROUTE).handler,
+  makeReq('POST', JSON.stringify({ title: 'DSH 需要你看一下', desp: '需要确认权限·会话A' })));
+assert.equal(res.code, 200, 'iLink 投递成功应回 200');
 assert.equal(JSON.parse(res.body).ok, true);
-assert.equal(sendCalls.length, 1, '应调用一次 ctx.dshIm.send');
-assert.equal(sendCalls[0].botId, 'PAGE_BOT');
-assert.equal(sendCalls[0].targetId, 'PAGE_TARGET');
-assert.match(sendCalls[0].text, /DSH 需要你看一下/);
-assert.match(sendCalls[0].text, /需要确认权限/);
-assert.ok(sendCalls[0].opts && sendCalls[0].opts.signal, '应传 AbortSignal');
-assert.ok(sendCalls[0].text.length <= 1800, '微信长文本应截到 1800 字以内');
-ok('Host 把 {title,desp,botId,targetId} 交给 dshIm.send 主动投递');
+ok('Host 经 iLink 主动投递成功（title+desp→sendmessage）');
 
-// 2f. 服务端兜底（cordis.patch.yml 的 config.botId / config.targetId）
-sendCalls.length = 0;
-res = await invoke(wechatRoute.handler, makeReq('POST', JSON.stringify({ title: '兜底' })));
+// 2m. 扫码登录：POST /login 取二维码 → qr.png 内嵌 GIF → DELETE /login 取消
+const LOGIN_STATE = '__dsh_ws_login_state__.json';
+const qrFetch = async (url, init) => {
+  const u = String(url);
+  let body = { ret: 0 };
+  if (u.includes('get_bot_qrcode')) body = { qrcode: 'QR_SMOKE', qrcode_img_content: 'https://liteapp.weixin.qq.com/q/QR_SMOKE?bot_type=3' };
+  else if (u.includes('get_qrcode_status')) {
+    // 挂起直到 abort（避免 wait 立即 resolve 造成 busy loop；DELETE /login 时收尾）
+    return new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+  }
+  return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+};
+const hcLogin = makeHostCtx({ stateFile: LOGIN_STATE, fetchImpl: qrFetch });
+const loginHandler = hcLogin.registered.find((r) => r.path === host.LOGIN_ROUTE).handler;
+res = await invoke(loginHandler, makeReq('POST', null));
 assert.equal(res.code, 200);
-assert.equal(sendCalls[0].botId, 'HOST_BOT');
-assert.equal(sendCalls[0].targetId, 'HOST_TARGET');
-ok('页面未给 ID 时回退到 config.botId / config.targetId');
-
-// 2g. 平台未接受（sent !== true）→ 502 delivery-not-sent
-sendResult = { sent: false, error: 'delivery-failed' };
-res = await invoke(wechatRoute.handler, makeReq('POST', JSON.stringify({
-  title: '重试场景', botId: 'PAGE_BOT', targetId: 'PAGE_TARGET',
-})));
-assert.equal(res.code, 502);
-assert.equal(JSON.parse(res.body).error, 'delivery-not-sent');
-sendResult = { sent: true };
-ok('dshIm.send 返回 sent!==true 时回 502 delivery-not-sent');
-
-// 2h. dsh-im 未就绪 → 502 dshim-unavailable（软依赖不拖垮挂载）
-const noIm = makeHostCtx({ botId: 'B', targetId: 'T' }, { withIm: false });
-const wNoIm = noIm.registered.find((r) => r.path === host.WECHAT_ROUTE);
-res = await invoke(wNoIm.handler, makeReq('POST', JSON.stringify({
-  title: 'x', botId: 'B', targetId: 'T',
-})));
-assert.equal(res.code, 502);
-assert.equal(JSON.parse(res.body).error, 'dshim-unavailable');
-ok('dshIm 服务未就绪时回 502 dshim-unavailable（软依赖不拖垮挂载）');
-
-// 2i. 【v1.1.1 回归】把 dsh-im「复制调用参数」的整段 JSON 误粘进目标 ID 栏：
-//     Host 自动拆回两个纯 ID，不再把整段丢给 dsh-im 触发 "Invalid target id"。
-//     这正是用户截图里「测试微信推送」失败的真实场景。
-sendCalls.length = 0;
-sendResult = { sent: true };
-// 用户截图里粘贴的实际是小写键 {"botid":...,"targetid":...}，用真实数据形态验证。
-const pastedPair = JSON.stringify({ botid: 'wx_d0301fd63db4606cc9d5cea', targetid: 'tgt_4912086eb0a42cb0' });
-res = await invoke(wechatRoute.handler, makeReq('POST', JSON.stringify({
-  title: 'DSH 需要你看一下',
-  desp: '测试',
-  botId: 'wx_d0301fd63db4606cc9d5cea',
-  targetId: pastedPair, // 用户把整段粘进了「微信目标 ID」框
-})));
-assert.equal(res.code, 200, '整段 JSON 应被自动拆分后成功投递');
-assert.equal(sendCalls.length, 1);
-assert.equal(sendCalls[0].botId, 'wx_d0301fd63db4606cc9d5cea');
-assert.equal(sendCalls[0].targetId, 'tgt_4912086eb0a42cb0', 'targetId 应是纯 ID 而非整段 JSON');
-assert.ok(!/[{}"]/.test(sendCalls[0].targetId), '交给 dsh-im 的 targetId 不能含 JSON 字符');
-ok('回归：整段「复制调用参数」JSON 误粘进单栏时自动拆成两个纯 ID');
-
-// 2i-2. 驼峰键 botId/targetId 同样要能拆（dsh-im 源码复制的是驼峰，用户可能粘小写）。
-sendCalls.length = 0;
-const pastedCamel = JSON.stringify({ botId: 'wx_d0301fd63db4606cc9d5cea', targetId: 'tgt_4912086eb0a42cb0' });
-res = await invoke(wechatRoute.handler, makeReq('POST', JSON.stringify({
-  title: 'x', desp: '测试', botId: 'wx_d0301fd63db4606cc9d5cea', targetId: pastedCamel,
-})));
+assert.equal(JSON.parse(res.body).status, 'waiting');
+res = await invoke(hcLogin.registered.find((r) => r.path === host.QR_IMAGE_ROUTE).handler, makeReq('GET', null));
+assert.equal(res.code, 200, '扫码后 qr.png 应返回内嵌二维码图片');
+assert.equal(res.headers['content-type'], 'image/gif', 'qr.png 应为 GIF 图片');
+assert.ok(Buffer.isBuffer(res.body) && res.body.slice(0, 4).toString() === 'GIF8', 'qr.png 应为合法 GIF 字节');
+res = await invoke(loginHandler, makeReq('DELETE', null)); // 取消后台轮询，避免测试后空转
 assert.equal(res.code, 200);
-assert.equal(sendCalls[0].targetId, 'tgt_4912086eb0a42cb0', '驼峰键也应拆成纯 targetId');
-ok('回归：驼峰键整段 JSON 同样自动拆成两个纯 ID');
-
-// 2j. 【v1.1.1 回归】dsh-im 抛英文校验错误时，返回体带中文 message。
-sendThrow = Object.assign(new Error('Invalid target id'), { code: 'invalid-target' });
-res = await invoke(wechatRoute.handler, makeReq('POST', JSON.stringify({
-  title: 'x', botId: 'PAGE_BOT', targetId: 'PAGE_TARGET',
-})));
-assert.equal(res.code, 502);
-const errBody = JSON.parse(res.body);
-assert.match(errBody.message, /目标 ID|纯 ID|复制调用参数/, '英文报错应翻成中文原因');
-assert.ok(!/^Invalid target id$/.test(errBody.message || ''), '不应再把原始英文直接抛给设置页');
-sendThrow = null;
-ok('回归：dsh-im 英文错误（Invalid target id）翻成中文 message');
+ok('扫码登录：POST 取二维码 → qr.png 内嵌 GIF 图片 → DELETE 取消');
 
 // ───────────────────── 3. Client half ─────────────────────
 const clientSrc = await readText('lib/client.js');
 const ReactStub = {
   createElement: (...args) => ({ type: args[0], props: args[1] }),
   useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
+  useEffect: () => {},
 };
 const store = new Map();
 const listeners = {};             // vm 内 uiSession.subscribe 回调写这里
@@ -383,6 +993,132 @@ assert.equal(Array.from(mod.inject).join(','), 'sessions,locale,slots');
 assert.equal(typeof mod.apply, 'function');
 ok('lib/client.js 模块包装与 inject/apply 导出');
 
+// ── 会话列表微信图标（纯 DOM 视觉增强，移植自 dsh-im，MIT） ──
+assert.equal(typeof mod.parseWechatSessionTitle, 'function', '应导出 parseWechatSessionTitle');
+assert.equal(typeof mod.installWechatSessionLogo, 'function', '应导出 installWechatSessionLogo');
+assert.ok(clientSrc.includes('Copyright (c) 2026 xmanrui'), '图标移植须保留 MIT 版权声明');
+assert.equal(String(mod.parseWechatSessionTitle('微信 · 甜屿林风')), '甜屿林风', '应解析中文微信前缀');
+assert.equal(String(mod.parseWechatSessionTitle('WeChat · Foo Bar')), 'Foo Bar', '应解析英文微信前缀');
+assert.equal(mod.parseWechatSessionTitle('微信 · '), null, '空标题不应解析');
+assert.equal(mod.parseWechatSessionTitle('普通会话标题'), null, '非微信标题不应解析');
+assert.equal(mod.parseWechatSessionTitle(null), null, '非字符串不应解析');
+// fakeDocument 无 defaultView/MutationObserver/CSS → 安装函数应保底 noop（返回函数、不抛错）
+const logoCleanup = mod.installWechatSessionLogo(fakeDocument);
+assert.equal(typeof logoCleanup, 'function', '特性检测不满足时应返回清理函数');
+assert.doesNotThrow(() => logoCleanup(), 'noop 清理函数不应抛错');
+ok('会话列表微信图标：前缀解析 + 特性检测 noop + MIT 声明');
+
+// ── 微信图标真 DOM mock：覆盖「React 增量渲染（childList addedNodes）」路径 ──
+// 上一版只有 fakeDocument（无 defaultView/MutationObserver/CSS）→ 整段 noop，
+// 77 项全过却没验证真机渲染。这里构造最小可用 DOM，显式触发 addedNodes。
+{
+  const ROW_SEL = '[role="treeitem"][aria-selected]';
+  const MARKED_SEL = '[data-dsh-ws-wxlogo]';
+  const TEXT_ATTR = 'data-dsh-ws-wxtext';
+  const MARK_ATTR = 'data-dsh-ws-wxlogo';
+  function descendants(el) {
+    let out = [];
+    for (const c of (el.children || [])) { out.push(c); out = out.concat(descendants(c)); }
+    return out;
+  }
+  function qsa(el, sel) {
+    const all = descendants(el);
+    if (sel === ROW_SEL) return all.filter((n) => n.matches && n.matches(sel));
+    if (sel === MARKED_SEL) return all.filter((n) => n.getAttribute && n.getAttribute(MARK_ATTR) !== null);
+    return [];
+  }
+  function makeTitle(text, owner) {
+    const attrs = {};
+    return {
+      tagName: 'SPAN', nodeType: 1, isConnected: true, classList: ['title'], _text: text,
+      get textContent() { return this._text; },
+      get childNodes() { return this._text ? [{ nodeType: 3 }] : []; },
+      get firstChild() { return this._text ? { nodeType: 3 } : null; },
+      getAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null; },
+      setAttribute(k, v) { attrs[k] = String(v); },
+      removeAttribute(k) { delete attrs[k]; },
+      closest(sel) { return sel === ROW_SEL ? owner : null; },
+      matches() { return false; },
+      querySelectorAll() { return []; },
+    };
+  }
+  function makeRow(text) {
+    const row = {
+      tagName: 'DIV', nodeType: 1, isConnected: true, classList: ['sessionRow'], children: [],
+      getAttribute(k) { return k === 'role' ? 'treeitem' : (k === 'aria-selected' ? 'false' : null); },
+      matches(sel) { return sel === ROW_SEL; },
+      closest(sel) { return sel === ROW_SEL ? row : null; },
+    };
+    const title = makeTitle(text, row);
+    row.children.push(title);
+    row.querySelectorAll = (sel) => qsa(row, sel);
+    return row;
+  }
+  let observerCb = null;
+  let createdStyle = null;
+  const domImages = [];
+  const domView = {
+    CSS: {
+      supports(prop, val) {
+        if (prop === 'content') {
+          if (String(val).indexOf('/ ""') >= 0) return false; // 强制走基础 attr() 降级分支
+          return String(val).indexOf('attr(') === 0;
+        }
+        if (prop === '-webkit-text-fill-color') return val === 'transparent';
+        return false;
+      },
+    },
+    Image: function () { const img = {}; domImages.push(img); return img; },
+    MutationObserver: function (cb) { observerCb = cb; this.observe = function () {}; this.disconnect = function () {}; },
+    // 不设 queueMicrotask → 代码用同步 fallback，便于断言
+  };
+  const domBody = {
+    nodeType: 1, isConnected: true, classList: [], children: [],
+    appendChild(el) { this.children.push(el); },
+    matches() { return false; },
+    closest() { return null; },
+    querySelectorAll(sel) { return qsa(this, sel); },
+  };
+  const domDoc = {
+    body: domBody,
+    head: { appendChild() {} },
+    defaultView: domView,
+    createElement(tag) {
+      const e = { tagName: String(tag).toUpperCase(), dataset: {}, textContent: '', removed: false, remove() { e.removed = true; } };
+      if (String(tag).toLowerCase() === 'style') createdStyle = e;
+      return e;
+    },
+  };
+  const domCleanup = mod.installWechatSessionLogo(domDoc);
+  assert.equal(typeof domCleanup, 'function', '真实 DOM mock 下应返回清理函数');
+  assert.ok(createdStyle, '应注入 <style>');
+  assert.ok(createdStyle && createdStyle.textContent.includes('content: attr(' + TEXT_ATTR + ');'), 'CSS 应含基础 attr() 内容（降级分支）');
+  assert.ok(createdStyle && !createdStyle.textContent.includes('/ ""'), '不支持新语法时不应输出 `attr() / ""`');
+  assert.equal(domImages.length, 1, '应预载一张微信 SVG 图片');
+  // 图片加载成功 → ready，初始扫描（body 为空，无行被标记）
+  domImages[0].onload();
+
+  // 模拟 React 增量渲染：新会话行以 childList.addedNodes 出现（旧版漏掉此路径）
+  const liveRow = makeRow('微信 · 甜屿林风');
+  domBody.appendChild(liveRow);
+  observerCb([{ type: 'childList', target: domBody, addedNodes: [liveRow], removedNodes: [] }]);
+  const liveTitle = liveRow.children[0];
+  assert.equal(liveTitle.getAttribute(MARK_ATTR), 'weixin', '增量加入的微信会话行应被标记为微信图标');
+  assert.equal(liveTitle.getAttribute(TEXT_ATTR), '甜屿林风', '标记应只保留纯标题文本');
+
+  // 非微信行不应被标记
+  const plainRow = makeRow('普通会话');
+  domBody.appendChild(plainRow);
+  observerCb([{ type: 'childList', target: domBody, addedNodes: [plainRow], removedNodes: [] }]);
+  assert.equal(plainRow.children[0].getAttribute(MARK_ATTR), null, '非微信标题不应被标记');
+
+  // dispose 应还原
+  domCleanup();
+  assert.equal(liveTitle.getAttribute(MARK_ATTR), null, '清理后应移除微信图标标记');
+  assert.equal(liveTitle.getAttribute(TEXT_ATTR), null, '清理后应移除纯标题属性');
+  ok('微信图标：childList addedNodes 增量渲染 + 降级 CSS + dispose 还原（真 DOM mock）');
+}
+
 // apply 之前就塞「陈旧」状态：插件加载那一刻挂着的待办 / 已完成都不该补发提醒。
 let fakeUiStatus = new Map([
   ['s0', { running: false, pendingInteraction: { kind: 'approval', key: 'old' }, completionUnread: true }],
@@ -390,6 +1126,8 @@ let fakeUiStatus = new Map([
 // sessions.list 快照：current 指「界面正停在哪条会话」（v1.3.0 会话级判据的数据源）。
 let fakeListSnapshot = { current: 'sA', byId: {} };
 const listListeners = {};   // vm 内 sessions.list.subscribe 回调写这里
+// workspaces.list 快照：archivedSessionIds 是归档会话集（归档/删除静默判据之一）。
+let fakeWorkspaceSnapshot = { archivedSessionIds: [] };
 
 const slotsInjected = [];
 const registeredSections = [];
@@ -399,6 +1137,7 @@ const fakeCtx = {
   get(name) {
     if (name === 'uiSession') return { sessionStatus: fakeStatusStore };
     if (name === 'sessions') return { list: fakeListStore };
+    if (name === 'workspaces') return { list: { getSnapshot: () => fakeWorkspaceSnapshot } };
     if (name === 'uiWorkspace') return { openSession: (sid) => { openSessionCalls.push(sid); } };
     return undefined;
   },
@@ -583,10 +1322,10 @@ assert.equal(fetchCalls[fetchCalls.length - 1].url, '/__dsh-plugin-wechat-sessio
 assert.equal(sentBody.title, '', '功能融合后富格式卡 title 留空（整段作 desp）');
 assert.match(sentBody.desp, /【 授予权限 】/, '需确认类富格式卡应带【 授予权限 】状态标签');
 assert.match(sentBody.desp, /Bash/, '富格式卡正文应带具体工具名');
-assert.match(sentBody.desp, /\/session sB /, '富格式卡应带 /session 切换命令');
+assert.match(sentBody.desp, /\/use sb\n\n绑定 sB/, '富格式卡应带 /use <前缀> + 绑定 <标题> 两行');
 assert.ok('botId' in sentBody && 'targetId' in sentBody, '转发体应带 botId/targetId');
 assert.ok(!('sendKey' in sentBody), '转发体不应再有 sendKey');
-ok('回归：前台超时没切过去看/没处理 → 发富格式微信卡（授予权限 + 会话 ID + /session 切换）');
+ok('回归：前台超时没切过去看/没处理 → 发富格式微信卡（授予权限 + 前缀/标题绑定两行）');
 
 // 回归【用户决策①】：正盯着的 sA 自己需要选择 → 保持安静（不弹、不起批次）。
 const notesBefore2 = createdNotifications.length;
@@ -762,6 +1501,70 @@ assert.equal(createdNotifications.length, nn0 + 1, '普通会话仍应弹桌面�
 assert.equal(batchTimeouts.length, nt0 + 1, '普通会话仍应起 30 秒微信兜底批次');
 ok('回归【m02943】：普通会话不受影响，仍照常弹窗 + 起微信兜底批次（过滤未误伤）');
 
+// ── 回归【归档/删除会话误弹对话完成】：noteAlert 唯一入口按 sid 过滤 ──
+// 真机 bug：归档 / 删除一个会话会同时引发 running 边沿 + completionUnread 上升沿
+// （各一次 → 弹窗+微信卡各 2 次）。isArchivedOrDeletedSession 用
+// workspaces.list.getSnapshot().archivedSessionIds（归档）+ sessions.list.getSnapshot().ids
+// （删除，用 ids 不用 byId）判断，只在信号明确证明时静默。
+// 先把存量批次排空，后台条件最严格（无过滤时全部会弹）。
+drainGuard = 0;
+while (fakeWindow.__dshPluginWechatSession.debug().batch && batchTimeouts.length && drainGuard++ < 30) {
+  batchTimer().fn();
+}
+assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, null, '存量批次应被排空');
+setAway(true);
+
+// 情形一：已归档会话——archivedSessionIds 含该 sid。
+function setWorkspaces(ids) { fakeWorkspaceSnapshot = { archivedSessionIds: ids }; }
+function setListIds(ids) { fakeListSnapshot = { current: 'sA', byId: {}, ids: ids }; if (listListeners.list) listListeners.list(); }
+
+setWorkspaces(['arch-sid']);
+setListIds(['arch-sid', 'sA']);   // 归档案仍可能在 ids 里（宿主未即时剔除），归档判据优先
+{
+  const sid = 'arch-sid';
+  const n0 = createdNotifications.length, t0 = batchTimeouts.length, f0 = fetchCalls.length;
+  // approval 边沿
+  pushStatus(new Map([
+    ['sA', { running: true }],
+    [sid, { running: true, pendingInteraction: { kind: 'approval', key: 'k-' + sid, toolName: 'Bash' }, completionUnread: false }],
+  ]));
+  // done 边沿（running true→false + completionUnread 上升）
+  pushStatus(new Map([
+    ['sA', { running: true }],
+    [sid, { running: false, completionUnread: true }],
+  ]));
+  assert.equal(createdNotifications.length, n0, '已归档会话不应弹桌面通知');
+  assert.equal(batchTimeouts.length, t0, '已归档会话不应起微信批次');
+  assert.equal(fetchCalls.length, f0, '已归档会话不应发微信');
+}
+ok('回归【归档会话】：archivedSessionIds 命中的会话 approval + done 全部静默');
+
+// 情形二：已删除会话——不在 sessions.list.ids 里（byId 仍保留 fallback 行，不可用 byId 判断）。
+setWorkspaces([]);               // 未归档
+setListIds(['sA']);              // del-sid 已从 ids 移除，但 byId 里可能还留着
+fakeListSnapshot.byId['del-sid'] = { displayTitle: '已删除会话' };
+{
+  const sid = 'del-sid';
+  const n0 = createdNotifications.length, t0 = batchTimeouts.length, f0 = fetchCalls.length;
+  pushStatus(new Map([
+    ['sA', { running: true }],
+    [sid, { running: true, pendingInteraction: { kind: 'approval', key: 'k-' + sid, toolName: 'Bash' }, completionUnread: false }],
+  ]));
+  pushStatus(new Map([
+    ['sA', { running: true }],
+    [sid, { running: false, completionUnread: true }],
+  ]));
+  assert.equal(createdNotifications.length, n0, '已删除会话不应弹桌面通知');
+  assert.equal(batchTimeouts.length, t0, '已删除会话不应起微信批次');
+  assert.equal(fetchCalls.length, f0, '已删除会话不应发微信');
+}
+ok('回归【删除会话】：不在 sessions.list.ids 的会话 approval + done 全部静默（用 ids 不用 byId）');
+
+// 复原信号，避免影响后续测试：空归档 + 不设 ids（走原有 byId 逻辑）。
+setWorkspaces([]);
+fakeListSnapshot = { current: 'sA', byId: {} };
+if (listListeners.list) listListeners.list();
+
 // ── 回归【m03179】：桌面弹窗/提示音「后台静默失败」治本修复 ──
 // 根因：toast() 把 new Notification 卡在 permission==='granted'，而申请权限只在
 // 首次手势做一次；DSH 重开换端口 → 新 origin → 权限回 default，窗口又在后台，
@@ -839,7 +1642,7 @@ ok('回归【m04774①/m05207】：只弹 1 张应用内浮层（右下角、可
 assert.match(clientSrc, /function showInAppToast/, '应存在应用内浮层实现');
 assert.ok(!/wechatSyncGuide/.test(clientSrc), '图3「在微信里直接选择」长文说明卡应已删除');
 assert.ok(!/\/sessionlist/.test(clientSrc), '长文里的 /sessionlist 绑定步骤应随卡片一并删除');
-assert.match(clientSrc, /\/session </, '实时推送文案仍应给出 /session 切换命令');
+assert.match(clientSrc, /\/use </, '实时推送文案仍应给出 /use 绑定命令');
 assert.ok(!/微信回[「']?编号/.test(clientSrc), '微信文案不应再有「回编号即可」的误导话术');
 ok('回归【m04774③】：真回填交 dsh-im 原生同步提问，图3长文说明卡已删，微信文案去掉误导话术');
 
@@ -897,13 +1700,13 @@ const askBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(askBody.title, '', '富格式卡 title 留空');
 const despAsk = askBody.desp;
 assert.match(despAsk, /会话「发布方案评审」【 需要选择 】/, '富格式卡首行应带会话名 + 状态标签');
-assert.match(despAsk, /\/session sAsk /, '富格式卡应带 /session 切换命令');
+assert.match(despAsk, /\/use sask\n\n绑定 发布方案评审/, '富格式卡应带 /use <前缀> + 绑定 <标题> 两行');
 assert.match(despAsk, /📌 正文：用哪种发布通道？/, '富格式卡正文应带具体问题');
-assert.match(despAsk, /选项1：npm/, '富格式卡应读真实编号选项');
-assert.match(despAsk, /选项2：Gitee Release/, '富格式卡应列出第二个编号选项');
-assert.match(despAsk, /—— 本条为实时状态提醒，勿在此回复 ——/, '富格式卡应带统一脚注');
+assert.match(despAsk, /A npm/, '富格式卡选项应为 A/B/C 字母编号');
+assert.match(despAsk, /B Gitee Release/, '富格式卡应列出 B 选项');
+assert.ok(despAsk.includes('需要选择') && despAsk.includes('sask 1A 2B'), '需选择卡脚注应带实际前缀 + 数字字母回填码');
 assert.equal(fakeWindow.__dshPluginWechatSession.debug().batch, null, '发完后批次应清空');
-ok('功能融合：需选择类 60 秒超时发富格式卡（状态标签 + 正文 + 编号选项 + /session 切换）');
+ok('功能融合：需选择类 60 秒超时发富格式卡（状态标签 + 正文 + 编号选项 + /use 绑定）');
 
 // B. 任务跑完类：沿用 timeoutSec = 30 秒，极简微信里【已完成】段突出「哪个会话完成了」。
 setSessions('sA', { sFin: { displayTitle: '周报生成' } });
@@ -925,14 +1728,15 @@ const finBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(finBody.title, '', 'done 富格式卡 title 留空');
 const despFin = finBody.desp;
 const finLines = despFin.split('\n\n');
-assert.equal(finLines.length, 6, 'done 富格式卡应为 6 段');
+assert.equal(finLines.length, 7, 'done 富格式卡应为 7 段（绑定指令拆两行）');
 assert.match(finLines[0], /^DeepSeek Harness · 会话「周报生成」【 已完成 】 \d{2}:\d{2}:\d{2}$/, 'done 卡首行逐字');
 assert.equal(finLines[1], '▸ 在微信里发送：', 'done 卡第 2 行逐字');
-assert.equal(finLines[2], '/session sFin ', 'done 卡第 3 行逐字（行尾带空格）');
-assert.equal(finLines[3], '即可切到该会话继续对话。 ', 'done 卡第 4 行逐字（行尾带空格）');
-assert.equal(finLines[4], '📌 正文：任务已跑完，切过去查看回答全文', 'done 卡第 5 行正文引导逐字');
-assert.equal(finLines[5], '—— 本条为实时状态提醒，勿在此回复 ——', 'done 卡第 6 行脚注逐字');
-ok('功能融合：任务跑完类 30 秒超时发富格式卡（6 段逐字 + title 留空）');
+assert.equal(finLines[2], '/use sfin', 'done 卡第 3 行 = /use <前缀>');
+assert.equal(finLines[3], '绑定 周报生成', 'done 卡第 4 行 = 绑定 <标题>');
+assert.equal(finLines[4], '即可绑定该会话，之后可并行处理审批。 ', 'done 卡第 5 行逐字（行尾带空格）');
+assert.equal(finLines[5], '📌 正文：任务已跑完，切过去查看回答全文', 'done 卡第 6 行正文引导逐字');
+assert.equal(finLines[6], '—— 本条为实时状态提醒，勿在此回复 ——', 'done 卡第 7 行脚注逐字');
+ok('功能融合：任务跑完类 30 秒超时发富格式卡（7 段逐字 + title 留空）');
 
 // C. 两类混在一批：计时器对准最早 deadline，到点只发到期项，未到期项
 //    留在批次里重排（不被提前一起发掉）——这是双超时不串台的关键。
@@ -1000,7 +1804,7 @@ ok('回归【m05207②】：设置页重排成卡片式分组（5 组 + 关于�
 // 目标：多个 DSH 会话 ↔ 单一微信私聊，直接在微信上实时交互。
 // 一个微信私聊在 dsh-im 里任一时刻只能绑 1 个 DSH 会话，故走「选项1」：
 //   下行 = 全会话状态变化立刻（不等超时）分标签推同一私聊，带会话 ID 与
-//          /session 切换命令；上行 = 用户在微信发 dsh-im 原生 /session 切会话。
+//          /use 绑定命令；上行 = 用户在微信发 dsh-im 原生 /session 切会话。
 //   回答全文 / 选项卡沿用 dsh-im 双向同步，不重复造轮子。
 // ① 源码级：默认关、复用 postWechat、边沿接线、切换命令、设置页卡片。
 assert.match(clientSrc, /realtimePush:\s*false/, 'DEFAULTS 里 realtimePush 默认关（零副作用）');
@@ -1008,12 +1812,14 @@ assert.match(clientSrc, /function postWechat\(/, '应有复用 Host /wechat 路�
 assert.match(clientSrc, /function summarizeRealtime\(/, '应有分标签拼装 summarizeRealtime');
 assert.match(clientSrc, /function pushRealtime\(/, '应有全会话实时推送入口 pushRealtime');
 assert.match(clientSrc, /pushRealtime\([\s\S]{0,80}?sid/, 'fireBatchTimeout 应把 sid 逐条传给 pushRealtime');
-assert.match(clientSrc, /\/session \{id\}/, '实时微信应带 /session <会话ID> 切换命令模板');
+assert.match(clientSrc, /\/use \{prefix\}/, '实时微信应带 /use <前缀> 模板');
+assert.match(clientSrc, /绑定 \{title\}/, '实时微信应带 绑定 <标题> 模板');
+assert.match(clientSrc, /function sessionPrefix\(/, 'client 应有与宿主一致的短前缀算法');
 assert.ok(!/card\(t\('groupRealtime'\)/.test(clientSrc), '功能融合：设置页独立的「多会话·实时推送」卡片渲染已删除');
-assert.match(clientSrc, /function testRealtime\(/, '设置页/全局 API 应有实时推送测试函数');
+assert.match(clientSrc, /function beginLogin\(/, '设置页应有扫码登录函数 beginLogin');
 assert.equal(fakeWindow.__dshPluginWechatSession.config.realtimePush, false,
   'v1.8.0 新开关默认关，保证 54 项旧断言零漂移');
-ok('功能融合【v1.8.0①】：源码级（postWechat / summarizeRealtime / pushRealtime 门禁 / /session 命令）齐备，实时卡已融合进超时发送');
+ok('功能融合【v1.8.0①】：源码级（postWechat / summarizeRealtime / pushRealtime 门禁 / /use 命令）齐备，实时卡已融合进超时发送');
 
 // ── 功能融合【v1.8.0②/③】：富格式卡改为「超时到期后」发送 ──
 // 用户要求功能融合：设置页只留超时设置；任务完成/需要选择/授予权限三类卡片沿用
@@ -1038,15 +1844,16 @@ assert.equal(fetchCalls.length, fRT0 + 1, '超时到期后发 1 条富格式卡'
 const rtBody = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(rtBody.title, '', '富格式卡 title 留空（整段作 desp）');
 const rtQ = rtBody.desp.split('\n\n');
-assert.equal(rtQ.length, 6, 'question 富格式卡应为 6 段');
+assert.equal(rtQ.length, 7, 'question 富格式卡应为 7 段');
 assert.match(rtQ[0], /^DeepSeek Harness · 会话「实时会话A」【 需要选择 】 \d{2}:\d{2}:\d{2}$/,
   'question 卡首行逐字（状态标签 + HH:MM:SS）');
 assert.equal(rtQ[1], '▸ 在微信里发送：', '指引第 2 行');
-assert.equal(rtQ[2], '/session sRT ', '指引 /session 行（行尾带空格）');
-assert.equal(rtQ[3], '即可切到该会话继续对话。 ', '指引第 4 行（行尾带空格）');
-assert.equal(rtQ[4], '📌 正文：选 A 还是 B？', '正文段独立成段');
-assert.equal(rtQ[5], '—— 本条为实时状态提醒，勿在此回复 ——', '统一脚注');
-ok('功能融合②：question 富格式卡超时到期后才发，6 段逐字');
+assert.equal(rtQ[2], '/use srt', '指引第 3 行 = /use <前缀>');
+assert.equal(rtQ[3], '绑定 实时会话A', '指引第 4 行 = 绑定 <标题>');
+assert.equal(rtQ[4], '即可绑定该会话，之后可并行处理审批。 ', '指引第 5 行（行尾带空格）');
+assert.equal(rtQ[5], '📌 正文：选 A 还是 B？', '正文段独立成段');
+assert.ok(rtQ[6].includes('需要选择') && rtQ[6].includes('srt 1A 2B'), 'question 卡脚注应带实际前缀 + 数字字母回填码');
+ok('功能融合②：question 富格式卡超时到期后才发，7 段逐字');
 
 // done 边沿同样超时后发（6 行逐字）；子代理静默；关微信开关不发
 const fRT1 = fetchCalls.length;
@@ -1061,15 +1868,16 @@ assert.equal(fetchCalls.length, fRT1 + 1, '超时到期后发 done 富格式卡'
 const rtDone = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(rtDone.title, '', 'done 卡 title 留空');
 const rtDoneLines = rtDone.desp.split('\n\n');
-assert.equal(rtDoneLines.length, 6, 'done 卡应恰为 6 行');
+assert.equal(rtDoneLines.length, 7, 'done 卡应恰为 7 行');
 assert.match(rtDoneLines[0], /^DeepSeek Harness · 会话「实时会话A」【 已完成 】 \d{2}:\d{2}:\d{2}$/,
   'done 卡首行逐字');
 assert.equal(rtDoneLines[1], '▸ 在微信里发送：', 'done 卡第 2 行逐字');
-assert.equal(rtDoneLines[2], '/session sRT ', 'done 卡第 3 行逐字（行尾带空格）');
-assert.equal(rtDoneLines[3], '即可切到该会话继续对话。 ', 'done 卡第 4 行逐字（行尾带空格）');
-assert.equal(rtDoneLines[4], '📌 正文：任务已跑完，切过去查看回答全文', 'done 卡第 5 行逐字');
-assert.equal(rtDoneLines[5], '—— 本条为实时状态提醒，勿在此回复 ——', 'done 卡第 6 行脚注逐字');
-ok('功能融合③：done 富格式卡超时到期后发，6 行逐字');
+assert.equal(rtDoneLines[2], '/use srt', 'done 卡第 3 行 = /use <前缀>');
+assert.equal(rtDoneLines[3], '绑定 实时会话A', 'done 卡第 4 行 = 绑定 <标题>');
+assert.equal(rtDoneLines[4], '即可绑定该会话，之后可并行处理审批。 ', 'done 卡第 5 行逐字（行尾带空格）');
+assert.equal(rtDoneLines[5], '📌 正文：任务已跑完，切过去查看回答全文', 'done 卡第 6 行逐字');
+assert.equal(rtDoneLines[6], '—— 本条为实时状态提醒，勿在此回复 ——', 'done 卡第 7 行脚注逐字');
+ok('功能融合③：done 富格式卡超时到期后发，7 行逐字');
 
 setSessions('sA', { sSub: { origin: 'subagent' } });
 const fRT2 = fetchCalls.length;
@@ -1134,12 +1942,13 @@ const expectedClock = new Date(1_700_000_000_000).toLocaleTimeString('zh-CN');
 const expectedDoneDesp = [
   `DeepSeek Harness · 会话「微信·甜屿林风」【 已完成 】 ${expectedClock}`,
   '▸ 在微信里发送：',
-  '/session sDone ',
-  '即可切到该会话继续对话。 ',
+  '/use sdone',
+  '绑定 微信·甜屿林风',
+  '即可绑定该会话，之后可并行处理审批。 ',
   '📌 正文：任务已跑完，切过去查看回答全文',
   '—— 本条为实时状态提醒，勿在此回复 ——',
 ].join('\n\n');
-assert.equal(dedupeDone.desp, expectedDoneDesp, 'done 卡在固定虚拟时钟下逐字等于 6 行模板');
+assert.equal(dedupeDone.desp, expectedDoneDesp, 'done 卡在固定虚拟时钟下逐字等于 7 行模板');
 
 pushStatus(new Map([
   ['sA', { running: true }],
@@ -1196,23 +2005,31 @@ ok('去重③：60s 窗口过期后同键可再发（不是一次性永久禁用
 
 Date.now = RealDateNow;   // 还原真实时钟
 
-// ── 端到端：client 富格式卡 body → 真实 Host handler → ctx.dshIm.send ──
-sendCalls.length = 0;
-sendResult = { sent: true };
-sendThrow = null;
-rejection = undefined;
-const e2eBody = JSON.stringify({
-  title: dedupeDone.title,
-  desp: dedupeDone.desp,
-  botId: dedupeDone.botId || 'wx_rt_bot',
-  targetId: dedupeDone.targetId || 'tgt_rt_target',
-});
-const e2eRes = await invoke(wechatRoute.handler, makeReq('POST', e2eBody));
+// ── 端到端：client 富格式卡 body → 真实 Host handler → iLink sendmessage ──
+const sentTexts = [];
+const e2eFetch = async (url, init) => {
+  const u = String(url);
+  let body = { ret: 0 };
+  if (u.includes('getupdates')) body = { ret: -14, errcode: -14 };
+  else if (u.includes('getconfig')) body = { typing_ticket: 'TICKET_SMOKE' };
+  else if (u.includes('sendmessage')) {
+    try {
+      const payload = JSON.parse(init.body);
+      sentTexts.push(payload?.msg?.item_list?.[0]?.text_item?.text || '');
+    } catch { /* ignore */ }
+  }
+  return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+};
+const hcE2E = makeHostCtx({}, { fetchImpl: e2eFetch });
+const e2eRoute = hcE2E.registered.find((r) => r.path === host.WECHAT_ROUTE);
+const e2eRes = await invoke(e2eRoute.handler, makeReq('POST', JSON.stringify({
+  title: dedupeDone.title, desp: dedupeDone.desp,
+})));
 assert.equal(e2eRes.code, 200, '富格式卡 body 应被 Host 正常受理');
-assert.equal(sendCalls.length, 1, '应调用一次 ctx.dshIm.send');
-assert.equal(sendCalls[0].text, expectedDoneDesp,
-  '最终发到微信的 text 逐字等于 6 行定制模板（title 留空 → Host 不插空行）');
-ok('端到端：client 富格式卡 → Host /wechat → ctx.dshIm.send，微信文本逐字对齐模板');
+assert.equal(sentTexts.length, 1, '应经 iLink sendmessage 发一次');
+assert.equal(sentTexts[0], expectedDoneDesp,
+  '最终发到微信的 text 逐字等于 7 行定制模板（title 留空 → Host 不插空行）');
+ok('端到端：client 富格式卡 → Host /wechat → iLink sendmessage，微信文本逐字对齐模板');
 
 // ── 选项块：question 卡读真实 options，超时到期后发 ──
 setSessions('sA', { sRT: { displayTitle: '实时会话A' } });
@@ -1227,16 +2044,56 @@ assert.equal(fetchCalls.length, fOpt + 1, '超时到期后发带选项 question 
 const rtOpt = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
 assert.equal(rtOpt.title, '', '带选项 question 卡 title 留空');
 const rtOptSegs = rtOpt.desp.split('\n\n');
-assert.equal(rtOptSegs.length, 9, '带选项 question 卡应为 9 段');
+assert.equal(rtOptSegs.length, 10, '带选项 question 卡应为 10 段');
 assert.match(rtOptSegs[0], /^DeepSeek Harness · 会话「实时会话A」【 需要选择 】 \d{2}:\d{2}:\d{2}$/, '首行逐字');
 assert.equal(rtOptSegs[1], '▸ 在微信里发送：', '指引第 2 行');
-assert.equal(rtOptSegs[2], '/session sRT ', '/session 行');
-assert.equal(rtOptSegs[3], '即可切到该会话继续对话。 ', '指引第 4 行');
-assert.equal(rtOptSegs[4], '📌 正文：请选择方案', '正文段');
-assert.equal(rtOptSegs[5], '选项1：选项甲', '选项 1');
-assert.equal(rtOptSegs[6], '选项2：选项乙', '选项 2');
-assert.equal(rtOptSegs[7], '选项3：选项丙', '选项 3');
-assert.equal(rtOptSegs[8], '—— 本条为实时状态提醒，勿在此回复 ——', '统一脚注');
+assert.equal(rtOptSegs[2], '/use srt', '/use <前缀> 行');
+assert.equal(rtOptSegs[3], '绑定 实时会话A', '绑定 <标题> 行');
+assert.equal(rtOptSegs[4], '即可绑定该会话，之后可并行处理审批。 ', '指引第 5 行');
+assert.equal(rtOptSegs[5], '📌 正文：请选择方案', '正文段');
+assert.equal(rtOptSegs[6], 'A 选项甲', '选项 A');
+assert.equal(rtOptSegs[7], 'B 选项乙', '选项 B');
+assert.equal(rtOptSegs[8], 'C 选项丙', '选项 C');
+assert.ok(rtOptSegs[9].includes('需要选择') && rtOptSegs[9].includes('srt 1A 2B'), '选项卡脚注应带实际前缀 + 数字字母回填码');
 ok('功能融合：选项块 question 卡超时到期后发，读真实 options 编号成段');
+
+// ── 多问题修复（m01440）：question 卡含 2+ 题时逐题输出「正文 + 选项」 ──
+setSessions('sA', { sMQ: { displayTitle: '多问题会话' } });
+const fMQ = fetchCalls.length;
+pushStatus(new Map([
+  ['sA', { running: true }],
+  ['sMQ', { running: true, pendingInteraction: {
+    kind: 'question', key: 'kMQ',
+    questions: [
+      { question: '第一题：选发布通道？', options: [{ label: 'npm' }, { label: 'Gitee' }] },
+      { question: '第二题：是否同时发通知？', options: [{ label: '发群消息' }, { label: '不发' }] },
+    ],
+  }, completionUnread: false }],
+]));
+assert.equal(fetchCalls.length, fMQ, '多问题 question 边沿也不立即发');
+batchTimer().fn();
+assert.equal(fetchCalls.length, fMQ + 1, '超时到期后发多问题 question 卡');
+const mq = JSON.parse(fetchCalls[fetchCalls.length - 1].opts.body);
+assert.equal(mq.title, '', '多问题卡 title 留空');
+const mqSegs = mq.desp.split('\n\n');
+// 首行 + 指引 4 行（绑定指令拆两行）+ [第1题正文 + 2 选项] + [第2题正文 + 2 选项] + 脚注 = 12 段
+assert.equal(mqSegs.length, 12, '两题卡应为 12 段（每题正文+选项，脚注 1）');
+assert.equal(mqSegs[2], '/use smq', '/use <前缀> 行');
+assert.equal(mqSegs[3], '绑定 多问题会话', '绑定 <标题> 行');
+assert.equal(mqSegs[5], '📌 正文：第一题：选发布通道？', '第 1 题正文');
+assert.equal(mqSegs[6], 'A npm', '第 1 题选项 A');
+assert.equal(mqSegs[7], 'B Gitee', '第 1 题选项 B');
+assert.equal(mqSegs[8], '📌 正文：第二题：是否同时发通知？', '第 2 题正文');
+assert.equal(mqSegs[9], 'A 发群消息', '第 2 题选项 A');
+assert.equal(mqSegs[10], 'B 不发', '第 2 题选项 B');
+assert.ok(mqSegs[11].includes('需要选择') && mqSegs[11].includes('smq 1A 2B'), '多问题卡脚注应带实际前缀 + 数字字母回填码');
+ok('多问题修复：2 题卡逐题输出正文+选项，单题输出保持原样');
+
+
+// ── 清理：停掉所有 host 长轮询 + 删除 smoke 临时状态文件 ──
+for (const hc of allHostCtxs) hc.dispose();
+for (const f of [STATE_MAIN, STATE_IDLE, DELIVER_STATE, LOGIN_STATE, BINDING_FILE, SETTINGS_FILE]) {
+  await unlink(f).catch(() => {});
+}
 
 console.log(`\n全部通过：${passed} 项断言。`);

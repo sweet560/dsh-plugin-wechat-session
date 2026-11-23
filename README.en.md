@@ -1,117 +1,93 @@
-# dsh-plugin-wechat-session (WeChat Session Bridge)
+# dsh-plugin-wechat-session (WeChat Channel Peripheral · v2.1.0)
 
-A reminder plugin for the **DeepSeek Harness desktop app**. It watches all your running
-sessions and links desktop alerts with a WeChat fallback.
-
-> When a session **needs your manual choice**, **needs permission approval**, or **finishes its
-> turn**, it raises a **desktop alert**: exactly ONE **in-app floating card** (does NOT depend on OS
-> notification permission — visible even when you are on another session, click to jump there) plus
-> an alert sound. No OS banner is shown anymore, so there is only one popup. If you neither switch to that
-> session nor clear its pending item within the timeout, it sends a **richly formatted WeChat card**
-> (task-finished / needs-choice / grants-permission, with the session ID and a `/session` switch
-> command) through the **dsh-im WeChat bot (regular
-> WeChat)**. Two event classes have separate, configurable timeouts: **"needs choice / approval"
-> defaults to 60s**, **"task finished" defaults to 30s**.
->
-> To answer "1 / choose 1" directly in WeChat and let the task continue: that is done by **dsh-im
-> native synced questions** — bind the current session to a WeChat private chat with two-way sync
-> enabled, and dsh-im pushes a numbered option card as soon as the question appears; replying with
-> a number writes the answer back into DSH. **Replies to messages this plugin sends are NOT
-> received** — do not reply under that reminder. Setup steps: Chinese README §3.1.
-
-Installing this one package brings both the WeChat Session Bridge plugin and `@xmanrui/dsh-im`
-(the WeChat bot). See the Chinese [README.md](./README.md) for full documentation.
+A reminder + WeChat channel plugin for the **DeepSeek Harness desktop app**. **v2.0.0 is a breaking rewrite**: it drops the `@xmanrui/dsh-im` aggregate dependency, talks to WeChat independently over the official iLink protocol, and does not take over session lifecycle — it is purely a **channel adapter + session referrer**. Sessions you explicitly bind with `/use` are persisted (no re-binding after restart). **v2.1.0 adds `/new` thin session creation**: send `/new` in WeChat to create a session in a configured working-folder workspace and bind it immediately (title gets a "微信 · " prefix, defaulting to "微信 · Clawbot").
 
 ## Features
 
-- Three triggers: permission approval / manual question / task finished (end of a model turn).
-- Content-rich toasts: title `session name · event label`, body extracted from `pendingInteraction`
-  (question text / tool name + reason), capped at 160 chars.
-- Click any notification to jump to the corresponding session (`uiWorkspace.openSession(sid)`).
-- Session-level supervision: when the window is in the foreground, only sessions you are NOT
-  looking at raise alerts (the one on screen stays quiet); when the window is in the background,
-  all sessions raise alerts.
-- "Responded" = switching to that session or clearing its pending item — cancels WeChat fallback.
-- WeChat fallback via dsh-im proactive delivery; no external webhook / Server 酱 / SendKey needed.
-- One in-app floating card only (no OS banner): it needs no OS notification permission and shows
-  on any session screen, fixing "only the sound plays, no popup" without a second duplicate popup.
-- Per-class timeouts (choice/approval 60s, task-finished 30s by default), each item carrying its
-  own deadline. On timeout this plugin pushes a **richly formatted WeChat card** per pending item:
-  needs-choice / grants-permission cards carry the session name + session ID + `/session` switch
-  command + the concrete question/body + numbered options; task-finished cards carry the session
-  tag + switch command + a body note. Reuses the battle-tested `summarizeRealtime` template.
-- "Reply directly in WeChat" is powered by **dsh-im native synced questions / remote approvals**,
-  NOT by this plugin parsing replies: dsh-im listens to `user-questions/request` / `approval/request`
-  and pushes a numbered option card to a WeChat private chat as soon as the question appears.
-  One-time setup: enable two-way sync in dsh-im (General → Delivery), then `/sessionlist` and
-  `/session <id>` in the chat to bind it to the current session. That card arrives immediately,
-  not after the 60s timeout; this plugin's timeout card is a formatted status message — **do not
-  reply under it** (use dsh-im's option card to reply). See Chinese README §3.1.
-- Umbrella bundle: one `insert` mounts two loader rows; dsh-im keeps an upgradeable `^5.10.0`
-  range and stays on the npm official source.
+- **Desktop alerts**: one in-app floating card (click to jump to the session) + sound when a session needs a choice / approval / finishes a turn; with parallel sessions, only the ones you are NOT watching alert.
+- **Timeout WeChat fallback**: after 60s (choice/approval) or 30s (task finished) without action, a richly formatted WeChat card with the short prefix and title is left as a record.
+- **Bidirectional free-form chat**: after `/use` binding or `/new` creation, plain text sent in WeChat is prompted into that session and the agent's final reply is mirrored back (intermediate thinking is not relayed line-by-line). The reply mirror is headed by a readable `DeepSeek Harness · Session「title」` line instead of a cryptic short code.
+- **Bidirectional parallel multi-session approval**: in WeChat, `/use <sessionId>` explicitly binds a session; approval cards carry a short prefix (e.g. `[3f2a]`), and replying `3f2a=1` approve / `=0` reject / `=c` cancel is delivered precisely to that session. Approvals across sessions are fully parallel — no more 1:1 serialization.
+- **Delayed reminders**: periodic reminder cards while an approval waits; auto-fallback on timeout or after the reminder cap; optional periodic summary of pending requests.
+- **No misdelivery / no false alerts for stale sessions**: once a bound session is archived or deleted, WeChat messages get a clear "archived or deleted — bind another with /use or create one with /new" reply instead of being silently queued; archived/deleted sessions no longer raise a false "conversation finished" toast or WeChat card.
 
-## Install
+Full rewrite notes: [v2.0.0 release notes](docs/RELEASE_NOTES_v2.0.0.md) and [CHANGELOG](CHANGELOG.md).
 
-```bash
-dsh plugin --profile desktop add dsh-plugin-wechat-session
-# or from local source:
-dsh plugin --profile desktop add "file:F:/.../dsh-plugin-wechat-session"
-```
+## 1. Install & login
 
-Restart the DSH desktop app afterwards, then open **Settings → 微信会话互通**, fill in the
-Bot ID + Target ID (copy Bot ID from dsh-im IM bot settings, and the targetId from "copy call
-params"; pasting the whole JSON into either field splits automatically), and use the two test
-buttons to verify.
+1. Install this package the usual DSH way (**single plugin — the dsh-im aggregate is no longer needed**).
+2. Open the plugin settings → "WeChat channel · QR login" → "QR login" → scan with WeChat.
+3. Credentials are saved automatically and the receive loop starts. State lives at `~/.dsh-plugin-wechat-session/ilink-state.json` (mode 0o600); re-scan when the token goes stale (errcode=-14).
+4. (Optional) In settings → "New session (WeChat /new)" set the working folder — auto-saved as you type; `/new` registers it as a workspace so sessions land in that workspace group (never "Ungrouped"), persisted at `~/.dsh-plugin-wechat-session/settings.json`.
 
-## Depends on two plugins
+> No Bot ID / Target ID needed. Official iLink supports direct chats only (no group chats); tokens have a limited lifetime (~24h in community tests) and require re-scanning.
 
-| Part | Source | Role |
+## 2. Drive sessions from WeChat (explicit addressing)
+
+Sessions are referenced explicitly: bind an existing one with `/use`, or create one with `/new` (auto-bound). Bindings are persisted (no re-binding after restart). Every action uses an explicit session reference; the short prefix is the 6 chars after the common `session-` head (e.g. `session-91b2175-…` → `91b217`), avoiding the all-collide-into-`sessio` problem.
+
+| Command | Effect |
+| --- | --- |
+| `/new` or `/new <title>` | Thin-create a session in the workspace matching the configured folder and bind it immediately; title gets a "微信 · " prefix (e.g. `/new 甜屿林风` → "微信 · 甜屿林风", default "微信 · Clawbot"); ready for chat right away |
+| `/use <sessionId>` or `/use <prefix>` | Bind an existing session (multiple allowed; approvals run in parallel); prefix like `91b217` |
+| `bind <session title>` or `/use <title>` | Bind by short title (e.g. `bind WeChat · Title`); no need to remember the full ID. Unique match binds directly; multiple matches return a candidate list |
+| `/list` | List bound sessions and prefixes |
+| `/release` | Release all bindings |
+| `/help` or `/?` | Show help |
+| `3f2a=1` / `3f2a=0` / `3f2a=c` | Approve / reject / cancel that session's oldest pending request (aliases: `1/y/yes`, `0/n/no`, `c/cancel`) |
+| `3f2a 1A 2B` | Answer that session's ask_user_question (multi-select like `3f2a 1AB`); maps question number + letter to option labels |
+
+- WeChat has a single interactive card: the DSH bottom-right floating notice stays instant; only after it times out without action does WeChat receive one richly formatted card (task finished / choice needed / approval needed), and that card itself is fillable.
+- The rich card includes `/use <prefix>` and `bind <session title>` (filled with the actual triggering session); either line binds that session.
+- Choice card: per-question text + `A/B/C` options, footer spells the actual prefix reply code, e.g. `3f2a 1A 2B` (multi-select `3f2a 1AB`), filling in that session precisely.
+- Approval / plan-review card: footer spells the actual prefix reply code, e.g. `3f2a=1 approve / 3f2a=0 reject / 3f2a=c cancel`.
+- Fill-in window defaults to 5 minutes (`approvalTimeoutMs`), leaving ample time after the floating notice times out and the card reaches WeChat.
+- A reply without a prefix, or with an unknown prefix, gets a prompt to specify it explicitly — never guessed as "the latest one", so no cross-talk.
+- Reply mirrors are delivered only for explicitly bound sessions, headed by `DeepSeek Harness · Session「title」` (falls back to the short code if the title is unavailable); approval/choice cards still use `[prefix]` as the reply code. Unbound sessions receive no reply mirror or chat input, but their timeout rich cards can still be answered by the card prefix (racing the native DSH UI answerer, first answer wins), never misrouted to the current bound session.
+
+## 3. Configuration
+
+`cordis.patch.yml` (or the settings page):
+
+| Key | Default | Meaning |
 | --- | --- | --- |
-| WeChat Session Bridge (this package) | `lib/index.js` + `lib/client.js` | watches all sessions, one in-app floating card + sound (no OS toasts), per-class timeout batches (60s / 30s), richly formatted WeChat cards on timeout, card-grouped settings page with draft + Save buttons, click-to-jump |
-| `@xmanrui/dsh-im` | npm official source, `^5.10.0` | regular WeChat bot that delivers the formatted timeout cards; its native synced questions / remote approvals post answerable numbered option cards and write your reply back to DSH |
+| `prefixLength` | 6 | Short session prefix length |
+| `approvalTimeoutMs` | 300000 | Fill-in hard timeout (ms, default 5 min, covers floating-notice timeout → rich card → reply) |
+| `remindIntervalMs` | 60000 | Reminder card interval (ms) |
+| `maxReminders` | 3 | Max reminder cards |
+| `permissionPreset` | `ask` | Timeout fallback: `ask` / `allow-once` / `reject` |
+| `summaryIntervalMs` | 0 | Pending summary interval (0=off) |
+| `questionTimeoutMs` | 0 | Choice fill-in timeout (0=use approvalTimeoutMs) |
+| `newSessionTitle` | `微信 · Clawbot` | Fixed name when `/new` omits a title |
 
-## Development
+The working folder is not a patch key — set it in settings → "New session (WeChat /new)" (auto-saved as you type), persisted to `settings.json`; `/new` registers it as a workspace so the new session joins that group.
 
-```bash
-npm test          # offline smoke test (pure Node)
-npm run pack      # npm pack --dry-run
+## 4. Structure
+
+```
+lib/
+  channel/ilink.mjs     pure iLink protocol client (zero dependencies)
+  channel/transport.js  iLink adapter (login/receive/typing/send), no DSH imports
+  host/bridge.js         SessionEventBridge + ApprovalGate + command parsing
+  host/binding-store.js  binding persistence (sessions + activeSession)
+  host/settings-store.js /new working-folder persistence (newSessionCwd)
+  index.js               host apply: 8 HTTP routes + ctx.on('session/event') / ctx.on('approval/request')
+  client.js              QR-login + working-folder settings UI + in-app floating cards
 ```
 
-CI: `.github/workflows/test.yml` runs the smoke test on push/PR (Node 24, actions @v7);
-`.github/workflows/publish.yml` publishes to npm via **Trusted Publishing (OIDC provenance)** when
-`package.json` version becomes a value not yet on the registry, guarded by an idempotency check —
-no `NPM_TOKEN` needed. `.github/workflows/sync-gitee.yml` mirrors `main` and tags to Gitee on every
-push (needs the repository secret `GITEE_SSH_PRIVATE_KEY`).
+Approval/question decision ownership stays on DSH's `approval/request` / `user-questions/request` waterfall: the plugin registers as an answerer, awaits the WeChat reply inside the callback, then returns the decision. The reply prefix is resolved not only against bound sessions but also against the **pending pool**, so rich cards from any session (including freshly `/new`-created, not-yet-`/use`-bound ones) can be answered by their own prefix without being misrouted to the current bound session. Bound sessions are answered exclusively by WeChat (no `next()`), matching "only one card on WeChat"; unbound sessions pass `next()` and race the native DSH UI answerer (`Promise.race`, first to settle wins, the loser is idempotently cancelled). In a race the winner decides and the other card may linger — an inherent limit of DSH's chain-veto waterfall.
 
-Current version: **1.9.0**.
+## 5. Development
 
-**v1.9.0 highlights (feature fusion + settings polish)**: ① the separate "Full-session realtime
-push" switch was removed — the previous "push a minimal message immediately on each status edge"
-behaviour is now folded into timeout delivery; ② when a timeout fires (60s for choice/approval,
-30s for task-finished), `fireBatchTimeout` pushes a **richly formatted WeChat card** per pending
-item (task-finished / needs-choice / grants-permission, with session name + session ID + `/session
-<sessionId>` switch command + the concrete question/body + numbered options), reusing the
-battle-tested `summarizeRealtime` template and its 60s dedupe instead of the old minimal digest;
-③ send the native dsh-im command `/session <sessionId>` in WeChat to switch the chat to that
-session and keep talking, with dsh-im two-way sync ("deliver model answers") pushing the full
-answers back — **multiple DSH sessions serially share one single WeChat account**; ④ the
-"WeChat bot / delivery target" and "Timeout" cards now use **draft + Save buttons** (config is
-written only on Save; the button is idle when unchanged, active when dirty, with hover feedback),
-with tighter card spacing; ⑤ the Save button's three states (idle / dirty / hover) follow the
-`dsh-session-archive` plugin tokens, adapting to light/dark themes. Smoke tests: 63 assertions.
-See `docs/RELEASE_NOTES_v1.9.0.md`.
+```bash
+node --check lib/index.js lib/host/bridge.js lib/host/binding-store.js lib/host/settings-store.js lib/channel/transport.js lib/channel/ilink.mjs
+node smoke/smoke-test.mjs   # 89 assertions: manifest + bridge unit + /new thin-create (workspaceId grouping + prefixed title) + settings-store + error localization + 8 routes/seams + QR login + parallel approval + any-session fill-in + body title line + archived/deleted-session guard + iLink e2e + client regressions
+```
 
-**v1.7.0 highlights**: ① desktop alerts are now a **single bottom-right in-app floating card**
-(no system notification permission needed, visible even from another session); the OS banner was
-removed so there is only one popup on screen; ② the settings page was regrouped into cards with a
-short expandable description; ③ WeChat fallback uses per-class timeouts (choice/approval 60s,
-task-finished 30s), each batch fired at its own deadline; ④ the WeChat message was cut from a
-question+options+setup wall of text down to a minimal reminder ([WAITING]/[FINISHED], session name
-only); ⑤ "reply 1 in WeChat" is handled by **dsh-im native synced questions** (one-time
-`/sessionlist` → `/session <id>` binding), and this plugin's timeout message explicitly says not to
-reply under it. See `docs/RELEASE_NOTES_v1.7.0.md`.
+## 6. Trade-offs
 
-**v1.6.0 highlights**: ignored Mnemon background delegated/subagent sessions; fixed the
-background "no popup, no sound" case; switched CI to npm trusted publishing (OIDC / provenance) and
-GitHub main → Gitee auto-sync; filled repository Topics and submitted the marketplace listing PR.
-See `docs/RELEASE_NOTES_v1.6.0.md` and §9 of the Chinese README.
+- No auto create/follow of bindings: first bind explicitly with `/use` or create with `/new` (persisted afterwards, no re-binding after restart) — zero cross-talk and full decoupling.
+- `/new` is "thin creation": one official DSH create (with workspaceId) + resume + rename call to get a sessionId and bind it immediately — no session pool, no auto cleanup, no mapping table; session lifecycle authority stays with DSH. `cwd` and `workspaceId` are mutually exclusive; passing only `cwd` lands "Ungrouped", so the folder is registered as a workspace first.
+- The "微信 · " prefixed title may be overwritten by DSH's auto-title after the first prompt (rename has no pinned field); renaming afterwards is DSH's job.
+- Direct chats only; token lifetime limited, re-scan when stale. The iLink protocol has no avatar interface; WeChat chat avatars are rendered by the client per account and cannot be controlled by this plugin.
+- Historic v1.x (dsh-im aggregate) changes remain in [CHANGELOG](CHANGELOG.md).

@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-wechat-session",
-  "version": "1.9.0",
-  "description": "微信会话互通聚合包：装这一个包就同时带上桌面提醒与 @xmanrui/dsh-im 微信机器人。多条会话并行时逐条监督，需要手动选择 / 需要确认权限 / 任务跑完都会在 DSH 窗口右下角弹唯一一张带具体内容、点一下可跳到对应会话的应用内浮层卡片并响提示音（不依赖系统通知权限）；两类事件各有独立超时（需选择 / 确认默认 60 秒、任务跑完默认 30 秒），超时没切过去看 / 没把待办处理掉，就发一条富格式微信卡片留底（任务完成 / 需要选择 / 授予权限三类，带会话 ID 与 /session 切换命令）。v1.9.0 功能融合：取消独立的「全会话实时推送」开关，把富格式卡（原有经过充分验证的实时推送 6 段模板）直接融入超时发送——超时到点后逐条推送带会话标签与 /session 切换命令的富格式卡；多个 DSH 会话共用单一微信号、靠 /session <会话ID> 串行切换后继续聊，回答全文由 dsh-im 双向同步回投，实现在微信上实时交互。设置页「微信机器人 / 投递目标」「超时设置」两卡改为草稿 + 保存按钮（点保存才生效），lib 按钮样式对齐归档插件、明暗主题自适应。真回填 / 选项卡由 dsh-im 原生同步提问完成（会话绑定指引见 dsh-im 文档）。",
+  "version": "2.1.0",
+  "description": "微信通道外设（v2.1.0）：不再依赖 @xmanrui/dsh-im，不接管会话生命周期。三模块——ChannelTransport（纯 iLink 协议适配器，扫码登录 + 长轮询收发）、SessionEventBridge（只读订阅 session/event / agent/assistant-stream，以会话标题行把最终回复镜像到微信、标题读不到退回短码）、ApprovalGate（approval/request / user-questions/request waterfall 应答者）。支持微信 /new 在指定工作目录对应的工作区分组薄创建会话并自动绑定（标题自动加「微信 · 」前缀，缺省「微信 · Clawbot」）、双向自由对话、多会话并行审批与选择题回填（<前缀>=1/0/c、<前缀> 1A 2B）、超时提醒卡、permissionPreset 自动降级、定时未决汇总；绑定与工作目录配置均持久化，重启免重配。零运行时依赖（iLink 协议层为纯 Node 实现）。",
   "license": "MIT",
   "author": "sweet560 <107355972+sweet560@users.noreply.github.com>",
   "type": "module",
@@ -17,6 +17,13 @@
   "files": [
     "lib/index.js",
     "lib/client.js",
+    "lib/channel/ilink.mjs",
+    "lib/channel/transport.js",
+    "lib/host/bridge.js",
+    "lib/host/binding-store.js",
+    "lib/host/settings-store.js",
+    "vendor/qrcode.cjs",
+    "vendor/qrcode-generator.README.md",
     "cordis.patch.yml",
     "icon.svg",
     "locale/en.json",
@@ -30,6 +37,8 @@
     "docs/RELEASE_NOTES_v1.7.0.md",
     "docs/RELEASE_NOTES_v1.8.0.md",
     "docs/RELEASE_NOTES_v1.9.0.md",
+    "docs/RELEASE_NOTES_v2.0.0.md",
+    "docs/RELEASE_NOTES_v2.1.0.md",
     "smoke/smoke-test.mjs"
   ],
   "keywords": [
@@ -38,19 +47,16 @@
     "dsh-plugin",
     "notification",
     "wechat",
-    "dsh-im",
+    "ilink",
     "desktop-notification",
     "reminder",
     "approval",
     "session",
-    "聚合包",
-    "一次安装",
-    "会话监督",
-    "联动提醒",
+    "通道外设",
+    "多会话并行审批",
+    "会话前缀",
     "桌面弹窗",
-    "系统通知",
     "微信通知",
-    "微信机器人",
     "提示音",
     "超时提醒"
   ],
@@ -60,9 +66,6 @@
   "scripts": {
     "test": "node smoke/smoke-test.mjs",
     "pack": "npm pack --dry-run"
-  },
-  "dependencies": {
-    "@xmanrui/dsh-im": "^5.10.0"
   },
   "publishConfig": {
     "access": "public"
