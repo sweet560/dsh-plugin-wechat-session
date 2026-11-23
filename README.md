@@ -1,5 +1,14 @@
 # dsh-plugin-wechat-session（微信会话互通 · 通道外设版 v2.2.2）
 
+<div align="center">
+  <a href="https://www.npmjs.com/package/dsh-plugin-wechat-session"><img alt="npm version" src="https://img.shields.io/npm/v/dsh-plugin-wechat-session" /></a>
+  <a href="https://www.npmjs.com/package/dsh-plugin-wechat-session"><img alt="npm downloads" src="https://img.shields.io/npm/dm/dsh-plugin-wechat-session" /></a>
+  <a href="https://github.com/sweet560/dsh-plugin-wechat-session/actions/workflows/test.yml"><img alt="CI" src="https://github.com/sweet560/dsh-plugin-wechat-session/actions/workflows/test.yml/badge.svg" /></a>
+  <a href="https://github.com/sweet560/dsh-plugin-wechat-session/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/sweet560/dsh-plugin-wechat-session" /></a>
+  <a href="https://opensource.org/licenses/MIT"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" /></a>
+  <a href="https://www.npmjs.com/package/@deepseek-ai/dsh?activeTab=versions"><img alt="Supported DSH versions: 0.2.0-rc.1+" src="https://img.shields.io/badge/DSH-0.2.0--rc.1%2B-4d6bfe" /></a>
+</div>
+
 给 **DeepSeek Harness 桌面端**用的提醒 + 微信通道插件。**v2.0.0 是破坏性重构**：去掉 `@xmanrui/dsh-im` 聚合依赖，独立通过官方 iLink 协议收发微信，不接管会话生命周期，只做**通道适配器 + 会话引用者**；你用 `/use` 显式绑定的会话会作为对话投递目标并持久化，重启免重绑。**v2.1.0 新增 `/new` 薄创建会话**：可在微信里发 `/new` 在指定工作区目录新建会话并自动绑定（标题自动加「微信 · 」前缀，缺省为「微信 · Clawbot」）。
 
 ## 核心功能

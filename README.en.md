@@ -1,5 +1,14 @@
 # dsh-plugin-wechat-session (WeChat Channel Peripheral · v2.2.2)
 
+<div align="center">
+  <a href="https://www.npmjs.com/package/dsh-plugin-wechat-session"><img alt="npm version" src="https://img.shields.io/npm/v/dsh-plugin-wechat-session" /></a>
+  <a href="https://www.npmjs.com/package/dsh-plugin-wechat-session"><img alt="npm downloads" src="https://img.shields.io/npm/dm/dsh-plugin-wechat-session" /></a>
+  <a href="https://github.com/sweet560/dsh-plugin-wechat-session/actions/workflows/test.yml"><img alt="CI" src="https://github.com/sweet560/dsh-plugin-wechat-session/actions/workflows/test.yml/badge.svg" /></a>
+  <a href="https://github.com/sweet560/dsh-plugin-wechat-session/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/sweet560/dsh-plugin-wechat-session" /></a>
+  <a href="https://opensource.org/licenses/MIT"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" /></a>
+  <a href="https://www.npmjs.com/package/@deepseek-ai/dsh?activeTab=versions"><img alt="Supported DSH versions: 0.2.0-rc.1+" src="https://img.shields.io/badge/DSH-0.2.0--rc.1%2B-4d6bfe" /></a>
+</div>
+
 A reminder + WeChat channel plugin for the **DeepSeek Harness desktop app**. **v2.0.0 is a breaking rewrite**: it drops the `@xmanrui/dsh-im` aggregate dependency, talks to WeChat independently over the official iLink protocol, and does not take over session lifecycle — it is purely a **channel adapter + session referrer**. Sessions you explicitly bind with `/use` are persisted (no re-binding after restart). **v2.1.0 adds `/new` thin session creation**: send `/new` in WeChat to create a session in a configured working-folder workspace and bind it immediately (title gets a "微信 · " prefix, defaulting to "微信 · Clawbot").
 
 ## Features
